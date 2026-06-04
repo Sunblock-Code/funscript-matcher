@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Personal config & runtime state — never commit
+config.json
+*_config.json
+matcher_config.json
+*.log
+*.err
+
+# Local caches / downloaded data
+data/
+downloads/
+
+# Windows shell integration & shortcuts
+desktop.ini
+*.lnk
+folderico-*.ico
+
+# Editor / assistant local settings
+.claude/
+.idea/
+.vscode/
