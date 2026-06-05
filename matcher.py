@@ -1487,6 +1487,7 @@ class App(QtWidgets.QMainWindow):
             f"Uses the Folder Icon Maker at {ICON_MAKER_DIR} and needs FFmpeg + "
             "ImageMagick configured there."
         )
+        self.icon_check.setChecked(True)
         opts.addWidget(self.icon_check, 2, 2)
 
         # Three checkbox columns share the width evenly.
