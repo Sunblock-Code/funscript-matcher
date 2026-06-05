@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,9 @@ except ImportError:
 ARCHIVE_EXTS = {".zip", ".rar"}
 
 CONFIG_FILE = Path(__file__).parent / "matcher_config.json"
+# Persistent activity log — only WARN and ERROR entries are written here so
+# failures survive a UI close/reopen. Trimmed when it grows past ~200 KB.
+ACTIVITY_LOG_FILE = Path(__file__).parent / "matcher_activity.log"
 
 # Folder Icon Maker — reused (lazily imported) to generate per-folder icons
 # from the paired video. Point this at your Folder Icon Maker checkout.
@@ -165,6 +169,12 @@ QLabel#min-score-label {
     font-size: 13px;
     font-weight: 500;
     letter-spacing: 0.2px;
+}
+QLabel#footer-label {
+    color: #a4abb5;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
 }
 QLabel#min-score-chip {
     background: #1c2128;
@@ -616,13 +626,36 @@ QPushButton#source-remove:disabled {
     color: transparent;
     border: 1px solid transparent;
 }
+QPushButton#source-recurse {
+    background: transparent;
+    border: 1px solid #30363d;
+    border-radius: 7px;
+    color: #8b949e;
+    font-size: 22px;
+    font-weight: 500;
+    padding: 0 0 2px 0;
+}
+QPushButton#source-recurse:hover {
+    background: #1c2128;
+    border-color: #484f58;
+    color: #d8dee4;
+}
+QPushButton#source-recurse:checked {
+    background: #0d2030;
+    border-color: #2f81f7;
+    color: #79c0ff;
+}
+QPushButton#source-recurse:checked:hover {
+    background: #14385a;
+    color: #ffffff;
+}
 QLineEdit#source-title {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 7px;
-    padding: 4px 8px;
+    padding: 2px 8px;
     color: #f0f6fc;
-    font-size: 17px;
+    font-size: 20px;
     font-weight: 700;
     letter-spacing: 0.2px;
     selection-background-color: #2f81f7;
@@ -636,7 +669,7 @@ QLineEdit#source-title:focus {
     border: 1px solid #2f81f7;
 }
 QFrame#section-divider {
-    background: #21262d;
+    background: #8b949e;
     border: none;
 }
 QLineEdit#combo-search {
@@ -711,9 +744,20 @@ class ScoreItemDelegate(QtWidgets.QStyledItemDelegate):
         text = opt.text
         opt.text = ""
 
-        widget = opt.widget
-        style = widget.style() if widget else QtWidgets.QApplication.style()
-        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, widget)
+        is_skip = text == "(skip)"
+        selected = bool(option.state & QtWidgets.QStyle.State_Selected)
+
+        if is_skip and not selected:
+            # Subtle warm tint so the "(skip)" entry stands apart from real
+            # matches without screaming for attention.
+            painter.save()
+            painter.fillRect(option.rect, QtGui.QColor("#1f1a16"))
+            painter.restore()
+        else:
+            widget = opt.widget
+            style = widget.style() if widget else QtWidgets.QApplication.style()
+            style.drawControl(
+                QtWidgets.QStyle.CE_ItemViewItem, opt, painter, widget)
 
         score = index.data(QtCore.Qt.UserRole)
         if not isinstance(score, (int, float)):
@@ -721,7 +765,6 @@ class ScoreItemDelegate(QtWidgets.QStyledItemDelegate):
 
         rect = option.rect.adjusted(12, 0, -12, 0)
         fm = QtGui.QFontMetrics(option.font)
-        selected = bool(option.state & QtWidgets.QStyle.State_Selected)
 
         painter.save()
         score_text = "" if score is None else f"{score:.2f}"
@@ -729,7 +772,12 @@ class ScoreItemDelegate(QtWidgets.QStyledItemDelegate):
         text_rect = QtCore.QRect(rect.left(), rect.top(),
                                  max(0, rect.width() - score_w), rect.height())
 
-        painter.setPen(QtGui.QColor("#ffffff" if selected else "#f0f6fc"))
+        if is_skip:
+            # Muted text so the (skip) entry reads as a fallback, not a match.
+            text_color = "#cce0ff" if selected else "#8b949e"
+        else:
+            text_color = "#ffffff" if selected else "#f0f6fc"
+        painter.setPen(QtGui.QColor(text_color))
         elided = fm.elidedText(text, QtCore.Qt.ElideRight, text_rect.width())
         painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, elided)
 
@@ -754,6 +802,71 @@ def _centered(widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
     layout.setAlignment(QtCore.Qt.AlignCenter)
     layout.addWidget(widget)
     return holder
+
+
+class SlideToggle(QtWidgets.QAbstractButton):
+    """iOS-style sliding on/off toggle. The thumb animates between the
+    left and right ends; track color shifts from muted gray to accent blue.
+    Behaves like a QCheckBox for state (isChecked / setChecked / toggled)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFixedSize(46, 24)
+        self._t = 1.0 if self.isChecked() else 0.0   # thumb interpolation 0..1
+        self._anim = QtCore.QVariantAnimation(self)
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(self._set_t)
+        self.toggled.connect(self._start_anim)
+
+    def _start_anim(self, checked: bool):
+        self._anim.stop()
+        self._anim.setStartValue(float(self._t))
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def _set_t(self, v):
+        self._t = float(v)
+        self.update()
+
+    def setChecked(self, c: bool):
+        was = self.isChecked()
+        super().setChecked(c)
+        if was == c:
+            # Sync thumb position even when no toggled signal fires
+            self._t = 1.0 if c else 0.0
+            self.update()
+
+    def sizeHint(self):
+        return QtCore.QSize(46, 24)
+
+    def paintEvent(self, _event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = self.rect()
+        radius = rect.height() / 2.0
+        off = QtGui.QColor("#30363d")
+        on = QtGui.QColor("#2f81f7")
+        t = self._t
+        track = QtGui.QColor(
+            int(off.red() + (on.red() - off.red()) * t),
+            int(off.green() + (on.green() - off.green()) * t),
+            int(off.blue() + (on.blue() - off.blue()) * t),
+        )
+        p.setBrush(track)
+        p.setPen(QtCore.Qt.NoPen)
+        p.drawRoundedRect(rect, radius, radius)
+
+        margin = 3
+        thumb_d = rect.height() - margin * 2
+        track_w = rect.width() - thumb_d - margin * 2
+        thumb_x = rect.left() + margin + int(t * track_w)
+        thumb_y = rect.top() + margin
+        p.setBrush(QtGui.QColor("#f0f6fc"))
+        p.drawEllipse(thumb_x, thumb_y, thumb_d, thumb_d)
+        p.end()
 
 
 class _NoWheelComboBox(QtWidgets.QComboBox):
@@ -1305,6 +1418,15 @@ class App(QtWidgets.QMainWindow):
         self.donate_btn.clicked.connect(self._show_donate)
         title_row.addWidget(self.donate_btn, 0, QtCore.Qt.AlignVCenter)
 
+        # Settings button — opens the options popup (auto-pair, alt colors,
+        # extract archives, etc.). Sits right of Donate, matches its size.
+        self.settings_btn = QtWidgets.QPushButton("SETTINGS")
+        self.settings_btn.setObjectName("log-toggle")
+        self.settings_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.settings_btn.setFixedSize(_btn_size)
+        self.settings_btn.clicked.connect(self._show_settings_dialog)
+        title_row.addWidget(self.settings_btn, 0, QtCore.Qt.AlignVCenter)
+
         self.log_toggle_btn = QtWidgets.QPushButton("LOG  ▸")
         self.log_toggle_btn.setObjectName("log-toggle")
         self.log_toggle_btn.setCheckable(True)
@@ -1331,9 +1453,11 @@ class App(QtWidgets.QMainWindow):
         pcv.addLayout(self.sources_container)
         self._add_source_row(initial=True)
 
-        # "+ Add another source" button — aligned under the entries
+        # "+ Add another source" button — flush-left under the folder boxes
+        # (folder boxes themselves are now left-aligned in the row, see
+        # _add_source_row where the title widget is no longer placed).
         add_src_row = QtWidgets.QHBoxLayout()
-        add_src_row.setContentsMargins(180 + 14, 0, 0, 0)
+        add_src_row.setContentsMargins(0, 0, 0, 0)
         self.add_source_btn = QtWidgets.QPushButton("+ Add another source")
         self.add_source_btn.setObjectName("add-source")
         self.add_source_btn.setCursor(QtCore.Qt.PointingHandCursor)
@@ -1388,12 +1512,13 @@ class App(QtWidgets.QMainWindow):
         L.addWidget(paths_card)
         self._paths_widget = paths_card
 
-        # Options grid — checkboxes align vertically in columns across both
-        # rows. Wrapped in a widget so we can collapse it in compact mode.
+        # The options checkboxes used to live in a grid here. They've moved
+        # to the Settings popup (accessible from the title row). The widgets
+        # are still created below so the existing save/load + signal
+        # plumbing keeps working, just not placed in a grid layout.
         self._opts_widget = QtWidgets.QWidget()
+        self._opts_widget.setVisible(False)  # legacy placeholder; never shown
         opts = QtWidgets.QGridLayout(self._opts_widget)
-        opts.setHorizontalSpacing(18)
-        opts.setVerticalSpacing(18)  # equal gaps left/right and up/down
         opts.setContentsMargins(0, 0, 0, 0)
 
         # Operation selector: one rounded box split by a divider line —
@@ -1433,35 +1558,31 @@ class App(QtWidgets.QMainWindow):
 
         self.auto_check = QtWidgets.QCheckBox("AUTO-PAIR 100% MATCHES")
         self.auto_check.setToolTip("On scan, pair anything with a perfect score automatically.")
-        opts.addWidget(self.auto_check, 0, 0)
 
-        self.hide_skipped_check = QtWidgets.QCheckBox("HIDE SKIPPED")
-        self.hide_skipped_check.setToolTip("Hide rows currently set to (skip).")
+        # Internal-only flag for skipped-row visibility — the visible control
+        # is the SlideToggle in the footer. We still keep a QCheckBox so the
+        # existing save/load paths and _reapply_filters logic don't change.
+        self.hide_skipped_check = QtWidgets.QCheckBox()
+        self.hide_skipped_check.setChecked(True)  # default: skipped rows hidden
+        self.hide_skipped_check.setVisible(False)
         self.hide_skipped_check.toggled.connect(self._apply_skip_filter)
-        opts.addWidget(self.hide_skipped_check, 0, 1)
 
         self.alt_colors_check = QtWidgets.QCheckBox("ALTERNATE ROW COLORS")
         self.alt_colors_check.setToolTip("Tint every other row for easier reading.")
         self.alt_colors_check.toggled.connect(lambda _: self._apply_alt_colors())
-        opts.addWidget(self.alt_colors_check, 0, 2)
 
-        self.recursive_check = QtWidgets.QCheckBox("SEARCH SUBFOLDERS")
-        self.recursive_check.setToolTip(
-            "Recurse into subdirectories. Folders that already look paired are left alone."
-        )
-        opts.addWidget(self.recursive_check, 1, 0)
+        # Per-source recursive: the "Sub" toggle next to each source row's
+        # Browse button replaces the old global checkbox.
 
         self.cross_source_check = QtWidgets.QCheckBox("MATCH ACROSS SOURCE FOLDERS")
         self.cross_source_check.setToolTip(
             "Allow scripts in one source folder to pair with videos in another."
         )
-        opts.addWidget(self.cross_source_check, 1, 1)
 
         self.move_existing_check = QtWidgets.QCheckBox("MOVE EXISTING PAIRED SUBFOLDERS")
         self.move_existing_check.setToolTip(
             "Also relocate already-paired subfolders inside the source(s) into the output folder."
         )
-        opts.addWidget(self.move_existing_check, 1, 2)
 
         self.extract_check = QtWidgets.QCheckBox("EXTRACT ARCHIVES")
         rar_note = "" if _HAS_RAR else "  (RAR needs: pip install rarfile)"
@@ -1470,7 +1591,6 @@ class App(QtWidgets.QMainWindow):
             "archive, then delete the original archive." + rar_note
         )
         self.extract_check.setChecked(True)
-        opts.addWidget(self.extract_check, 2, 0)
 
         self.score_color_check = QtWidgets.QCheckBox("COLOR-CODE SCORES")
         self.score_color_check.setToolTip(
@@ -1478,7 +1598,6 @@ class App(QtWidgets.QMainWindow):
             "matches, through orange, down to red for the weakest."
         )
         self.score_color_check.toggled.connect(self._on_score_color_toggled)
-        opts.addWidget(self.score_color_check, 2, 1)
 
         self.icon_check = QtWidgets.QCheckBox("CREATE FOLDER ICONS")
         self.icon_check.setToolTip(
@@ -1488,13 +1607,10 @@ class App(QtWidgets.QMainWindow):
             "ImageMagick configured there."
         )
         self.icon_check.setChecked(True)
-        opts.addWidget(self.icon_check, 2, 2)
 
-        # Three checkbox columns share the width evenly.
-        opts.setColumnStretch(0, 1)
-        opts.setColumnStretch(1, 1)
-        opts.setColumnStretch(2, 1)
-        L.addWidget(self._opts_widget)
+        # Settings popup is created lazily on first click of the Settings
+        # button. The above checkboxes get parented to it then.
+        self._settings_dialog = None
 
         # Action row: Operation box · Min-match box · slider · Scan
         action_row = QtWidgets.QHBoxLayout()
@@ -1577,7 +1693,11 @@ class App(QtWidgets.QMainWindow):
         self.table.setFocusPolicy(QtCore.Qt.NoFocus)
         self.table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
-        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        # AsNeeded (default) instead of AlwaysOff — AlwaysOff makes Qt
+        # clamp column resizes to the viewport, which silently blocks
+        # dragging the Matched-video / Score boundary. With AsNeeded the
+        # scrollbar still stays hidden unless columns truly overflow.
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.table.setAlternatingRowColors(False)
         self.table.setTextElideMode(QtCore.Qt.ElideRight)
 
@@ -1605,6 +1725,13 @@ class App(QtWidgets.QMainWindow):
         if sc_item is not None:
             sc_item.setToolTip("Click to sort by score (toggles high→low / low→high)")
 
+        # Right-click context menu on table rows. Connect on the viewport
+        # so the position passed to our handler is already in viewport
+        # coordinates (which is what QTableWidget.indexAt expects).
+        self.table.viewport().setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.table.viewport().customContextMenuRequested.connect(
+            self._on_table_context_menu)
+
         ml.addWidget(self.table)
         L.addWidget(matches_card, 1)
 
@@ -1621,8 +1748,56 @@ class App(QtWidgets.QMainWindow):
         footer.setSpacing(12)
         self.status_label = QtWidgets.QLabel("Pick a source folder to begin.")
         self.status_label.setObjectName("status")
-        footer.addWidget(self.status_label)
-        footer.addStretch()
+        # Give the status label enough room to show its full text — without
+        # an explicit minimum width and an expanding size policy it gets
+        # clipped to a few chars when the footer is crowded.
+        self.status_label.setMinimumWidth(280)
+        self.status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
+        footer.addWidget(self.status_label, 1)
+
+        # "Show skipped" slide-toggle. Default OFF — skipped rows are hidden
+        # on launch. When the user flips it on the thumb slides right and
+        # skipped rows reappear. Wired to hide_skipped_check (the inverse)
+        # so all existing filter logic keeps working unchanged.
+        show_skip_label = QtWidgets.QLabel("Show skipped")
+        show_skip_label.setObjectName("footer-label")
+        footer.addWidget(show_skip_label)
+        self.show_skipped_toggle = SlideToggle()
+        self.show_skipped_toggle.setChecked(False)
+        self.show_skipped_toggle.setToolTip(
+            "Off: hide rows currently set to (skip).\n"
+            "On: show skipped rows alongside matches."
+        )
+        self.show_skipped_toggle.toggled.connect(
+            lambda on: self.hide_skipped_check.setChecked(not on)
+        )
+        # Also build any missing skip-defaulted rows when the user flips it on.
+        self.show_skipped_toggle.toggled.connect(
+            lambda _on: self._ensure_rows_for_threshold(
+                self.min_score_slider.value() / 100.0
+            )
+        )
+        footer.addWidget(self.show_skipped_toggle)
+        footer.addSpacing(12)
+
+        # "Show done" slide-toggle — sits to the right of Show skipped.
+        # Default ON so already-applied rows stay visible; flip off to
+        # focus the list on pairs that still need work.
+        show_done_label = QtWidgets.QLabel("Show done")
+        show_done_label.setObjectName("footer-label")
+        footer.addWidget(show_done_label)
+        self.show_done_toggle = SlideToggle()
+        self.show_done_toggle.setChecked(True)
+        self.show_done_toggle.setToolTip(
+            "On: pairs marked Done ✓ stay in the list.\n"
+            "Off: hide already-applied pairs so only outstanding work is shown."
+        )
+        self.show_done_toggle.toggled.connect(lambda _: self._reapply_filters())
+        footer.addWidget(self.show_done_toggle)
+        footer.addSpacing(8)
+
         self.apply_btn = QtWidgets.QPushButton("Apply")
         self.apply_btn.setObjectName("primary")
         self.apply_btn.setMinimumHeight(40)
@@ -1638,6 +1813,9 @@ class App(QtWidgets.QMainWindow):
         self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 0)
         self.log_panel.hide()
+        # Replay persisted WARN/ERROR entries from prior sessions so failures
+        # don't vanish on UI close.
+        self._restore_log()
 
     # ----- log panel -----
     def _build_log_panel(self) -> QtWidgets.QFrame:
@@ -1696,6 +1874,63 @@ class App(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._ensure_log_panel_width)
         if hasattr(self, "_save_state"):
             self._save_state()
+
+    def _show_settings_dialog(self):
+        """Open the Settings popup. Lazily creates the dialog on first
+        click; subsequent clicks just reshow it. The checkboxes are the
+        same instance widgets used at save/load time, so toggling them
+        in the dialog persists immediately."""
+        if self._settings_dialog is None:
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Settings")
+            dlg.setModal(False)
+            dlg.setStyleSheet("QDialog { background: #0d1117; }")
+            v = QtWidgets.QVBoxLayout(dlg)
+            v.setContentsMargins(24, 22, 24, 22)
+            v.setSpacing(14)
+
+            title = QtWidgets.QLabel("Settings")
+            title.setStyleSheet(
+                "font-size: 18px; font-weight: 700; color: #f0f6fc;"
+                " letter-spacing: 0.3px;"
+            )
+            v.addWidget(title)
+            sub = QtWidgets.QLabel(
+                "Toggle behavior options. Changes apply immediately and "
+                "persist between sessions."
+            )
+            sub.setStyleSheet("color: #8b949e; font-size: 12px;")
+            sub.setWordWrap(True)
+            v.addWidget(sub)
+            v.addSpacing(6)
+
+            # Re-parent the existing checkboxes — keeps all signals intact.
+            for chk in (
+                self.auto_check,
+                self.cross_source_check,
+                self.move_existing_check,
+                self.extract_check,
+                self.alt_colors_check,
+                self.score_color_check,
+                self.icon_check,
+            ):
+                v.addWidget(chk)
+
+            v.addStretch()
+
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.setObjectName("primary")
+            close_btn.setMinimumHeight(36)
+            close_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            close_btn.clicked.connect(dlg.close)
+            v.addWidget(close_btn, 0, QtCore.Qt.AlignRight)
+
+            dlg.resize(440, 380)
+            self._settings_dialog = dlg
+
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     def _show_donate(self):
         """Donation popup — Ko-fi link + Monero (XMR) address with QR."""
@@ -1765,37 +2000,19 @@ class App(QtWidgets.QMainWindow):
         htxt.addWidget(ms)
         head.addLayout(htxt)
         head.addStretch()
-        copy_btn = QtWidgets.QPushButton("Copy")
-        copy_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        copy_btn.setStyleSheet(
-            "QPushButton { background: #22272e; border: 1px solid #e0709a;"
-            " border-radius: 8px; color: #e0709a; padding: 6px 12px;"
-            " font-weight: 700; } QPushButton:hover { background: #2a1c25; }")
-
-        def _copy():
-            QtWidgets.QApplication.clipboard().setText(XMR)
-            copy_btn.setText("✓ Copied")
-            copy_btn.setStyleSheet(
-                "QPushButton { background: #22272e; border: 1px solid #3fb950;"
-                " border-radius: 8px; color: #3fb950; padding: 6px 12px;"
-                " font-weight: 700; }")
-            QtCore.QTimer.singleShot(1400, lambda: (
-                copy_btn.setText("Copy"),
-                copy_btn.setStyleSheet(
-                    "QPushButton { background: #22272e; border: 1px solid #e0709a;"
-                    " border-radius: 8px; color: #e0709a; padding: 6px 12px;"
-                    " font-weight: 700; } QPushButton:hover { background: #2a1c25; }")))
-        copy_btn.clicked.connect(_copy)
-        head.addWidget(copy_btn, 0, QtCore.Qt.AlignTop)
         cv.addLayout(head)
 
+        # Address bar — flush gray rectangle, no rounded corners, no inner
+        # border. The text is selectable so the user can grab it directly
+        # without needing a Copy button.
         addr = QtWidgets.QLabel(XMR)
         addr.setWordWrap(True)
         addr.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        addr.setCursor(QtCore.Qt.IBeamCursor)
         addr.setStyleSheet(
-            "background: #0d1117; border: 1px solid #30363d; border-radius: 8px;"
-            " color: #c9d1d9; font-family: Consolas, monospace; font-size: 11px;"
-            " padding: 8px;")
+            "background: #30363d; border: none; border-radius: 0px;"
+            " color: #f0f6fc; font-family: Consolas, monospace; font-size: 11px;"
+            " padding: 10px 12px;")
         cv.addWidget(addr)
 
         try:
@@ -1851,6 +2068,32 @@ class App(QtWidgets.QMainWindow):
     def _clear_log(self):
         if hasattr(self, "log_view"):
             self.log_view.clear()
+        # Also clear the persisted activity log so cleared failures stay
+        # cleared across restarts.
+        try:
+            if ACTIVITY_LOG_FILE.exists():
+                ACTIVITY_LOG_FILE.unlink()
+        except OSError:
+            pass
+
+    # Map of tag → color used both for live logging and restored entries.
+    _LOG_COLORS = {
+        "ERROR": "#ff7b72",
+        "WARN ": "#e3b341",
+        "OK   ": "#56d364",
+        "INFO ": "#d8dee4",
+    }
+
+    def _render_log_line(self, ts: str, tag: str, msg: str) -> str:
+        color = self._LOG_COLORS.get(tag, "#d8dee4")
+        safe = html.escape(msg).replace("  ", "&nbsp;&nbsp;")
+        return (
+            f'<div style="margin: 2px 0;">'
+            f'<span style="color: #6e7681;">{ts}</span> '
+            f'<span style="color: {color}; font-weight: 600;">{tag}</span> '
+            f'<span style="color: {color};">{safe}</span>'
+            f'</div>'
+        )
 
     def _log(self, msg: str):
         if not hasattr(self, "log_view"):
@@ -1864,48 +2107,93 @@ class App(QtWidgets.QMainWindow):
         body = stripped[1:].lstrip() if stripped.startswith("!") else stripped
         lower = body.lower()
         if any(k in lower for k in ("skipped", "collision", "skipping")):
-            color = "#e3b341"   # amber
             tag = "WARN "
         elif any(k in lower for k in ("failed", "error", "couldn't", "could not")):
-            color = "#ff7b72"   # red
             tag = "ERROR"
         elif stripped.startswith("!"):
-            # Fallback for "!" lines without a clearer keyword
-            color = "#e3b341"
             tag = "WARN "
         elif any(body.startswith(p) for p in (
             "Auto-paired", "Moved", "Copied", "Merged", "Renamed", "Extracted",
         )) or "extracted" in lower:
-            color = "#56d364"   # green
             tag = "OK   "
         else:
-            color = "#d8dee4"   # default
             tag = "INFO "
 
-        safe = html.escape(msg).replace("  ", "&nbsp;&nbsp;")
-        line = (
-            f'<div style="margin: 2px 0;">'
-            f'<span style="color: #6e7681;">{ts}</span> '
-            f'<span style="color: {color}; font-weight: 600;">{tag}</span> '
-            f'<span style="color: {color};">{safe}</span>'
-            f'</div>'
-        )
-        self.log_view.append(line)
+        self.log_view.append(self._render_log_line(ts, tag, msg))
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+        # Persist WARN / ERROR so failures survive close+reopen.
+        if tag.strip() in ("WARN", "ERROR"):
+            try:
+                with open(ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
+                    # Use a delimiter that won't appear in timestamps/tags.
+                    safe_msg = msg.replace("\n", " ").replace("\r", " ")
+                    f.write(f"{ts}\t{tag.strip()}\t{safe_msg}\n")
+            except OSError:
+                pass
+
+    def _restore_log(self):
+        """Replay the persisted WARN/ERROR entries from previous sessions
+        into the log view at startup. A separator marks the boundary so
+        old failures are visually distinct from this session's output."""
+        if not hasattr(self, "log_view") or not ACTIVITY_LOG_FILE.exists():
+            return
+        try:
+            text = ACTIVITY_LOG_FILE.read_text(encoding="utf-8")
+        except OSError:
+            return
+        lines = [ln for ln in text.splitlines() if ln]
+        if not lines:
+            return
+        # Trim if the file has grown large so the next write doesn't keep
+        # the cost growing forever.
+        try:
+            if ACTIVITY_LOG_FILE.stat().st_size > 200_000:
+                lines = lines[-500:]
+                ACTIVITY_LOG_FILE.write_text(
+                    "\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        # Cap how many we replay so the panel isn't flooded.
+        for ln in lines[-300:]:
+            parts = ln.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            ts, level, msg = parts
+            tag = "ERROR" if level == "ERROR" else "WARN "
+            self.log_view.append(self._render_log_line(ts, tag, msg))
+        self.log_view.append(
+            "<div style='color: #6e7681; margin: 8px 0 4px 0; "
+            "padding-top: 6px; border-top: 1px solid #21262d; font-size: 11px;'>"
+            "── previous failures above · current session below ──</div>"
+        )
 
     # ----- persistence -----
     def _load_state(self):
         cfg = load_config()
 
+        # Sources may be a list of strings (legacy) or a list of
+        # {"path": "...", "recursive": true} objects (current).
         sources = cfg.get("sources")
         if not sources and cfg.get("source"):
             sources = [cfg["source"]]
+
+        def _norm(s):
+            if isinstance(s, dict):
+                return s.get("path", ""), bool(s.get("recursive", True))
+            return str(s or ""), True
+
         if sources:
-            if sources[0]:
-                self.source_rows[0]["entry"].setText(sources[0])
+            first_path, first_rec = _norm(sources[0])
+            if first_path:
+                self.source_rows[0]["entry"].setText(first_path)
+            rec_btn0 = self.source_rows[0].get("recurse")
+            if rec_btn0 is not None:
+                rec_btn0.setChecked(first_rec)
             for extra in sources[1:]:
-                self._add_source_row(initial=False, path=extra)
+                ep, er = _norm(extra)
+                self._add_source_row(initial=False, path=ep, recursive=er)
 
         if cfg.get("output"):
             self.output_entry.setText(cfg["output"])
@@ -1919,10 +2207,11 @@ class App(QtWidgets.QMainWindow):
                 self.op_mode_combo.setCurrentIndex(idx)
         if "auto" in cfg:
             self.auto_check.setChecked(bool(cfg["auto"]))
-        if "hide_skipped" in cfg:
-            self.hide_skipped_check.setChecked(bool(cfg["hide_skipped"]))
-        if "recursive" in cfg:
-            self.recursive_check.setChecked(bool(cfg["recursive"]))
+        # "Show skipped" intentionally resets to OFF on every launch so the
+        # table opens clean — skipped rows are hidden by default regardless
+        # of the previously-saved value.
+        self.hide_skipped_check.setChecked(True)
+        self.show_skipped_toggle.setChecked(False)
         if "cross_source" in cfg:
             self.cross_source_check.setChecked(bool(cfg["cross_source"]))
         if "move_existing" in cfg:
@@ -1946,14 +2235,12 @@ class App(QtWidgets.QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(500)
         self._save_timer.timeout.connect(self._save_state)
-        for row in self.source_rows:
-            row["entry"].textChanged.connect(self._save_timer.start)
-            row["entry"].textChanged.connect(self._scan_timer.start)
+        # Source-row signals are routed through _on_source_changed (wired in
+        # _add_source_row), so they don't need re-binding here.
         self.output_entry.textChanged.connect(self._save_timer.start)
         self.op_mode_combo.currentIndexChanged.connect(self._save_state)
         self.auto_check.toggled.connect(self._save_state)
         self.hide_skipped_check.toggled.connect(self._save_state)
-        self.recursive_check.toggled.connect(self._save_state)
         self.cross_source_check.toggled.connect(self._save_state)
         self.move_existing_check.toggled.connect(self._save_state)
         self.extract_check.toggled.connect(self._save_state)
@@ -1961,7 +2248,6 @@ class App(QtWidgets.QMainWindow):
         self.icon_check.toggled.connect(self._save_state)
         # Not saving min_score — it's a per-session setting (see _load_state).
         # Options that affect which pairs are produced auto-rescan immediately.
-        self.recursive_check.toggled.connect(lambda _: self._scan_timer.start())
         self.cross_source_check.toggled.connect(lambda _: self._scan_timer.start())
         self.move_existing_check.toggled.connect(lambda _: self._scan_timer.start())
         self.extract_check.toggled.connect(lambda _: self._scan_timer.start())
@@ -1979,16 +2265,25 @@ class App(QtWidgets.QMainWindow):
             )
 
     def _save_state(self):
-        sources = [row["entry"].text() for row in self.source_rows]
+        # Sources now persist as {path, recursive} objects so each row can
+        # carry its own subfolder-search toggle. Plain-string sources from
+        # older configs are still accepted on load.
+        sources_obj = []
+        for row in self.source_rows:
+            entry = row["entry"].text()
+            rec_btn = row.get("recurse")
+            sources_obj.append({
+                "path": entry,
+                "recursive": bool(rec_btn.isChecked()) if rec_btn else True,
+            })
         save_config({
-            "sources": sources,
-            "source": sources[0] if sources else "",  # back-compat with older readers
+            "sources": sources_obj,
+            "source": sources_obj[0]["path"] if sources_obj else "",  # back-compat
             "output": self.output_entry.text(),
             "op_mode": self._op_mode(),
             "move": self._op_mode() == "move",  # back-compat with older readers
             "auto": self.auto_check.isChecked(),
             "hide_skipped": self.hide_skipped_check.isChecked(),
-            "recursive": self.recursive_check.isChecked(),
             "cross_source": self.cross_source_check.isChecked(),
             "move_existing": self.move_existing_check.isChecked(),
             "extract": self.extract_check.isChecked(),
@@ -2034,11 +2329,24 @@ class App(QtWidgets.QMainWindow):
         entry.setText(path)
         self._save_state()
 
-    def _add_source_row(self, initial: bool = False, path: str = ""):
-        """Append a source folder row. The first (initial=True) one cannot be removed."""
-        row_layout = QtWidgets.QHBoxLayout()
+    def _add_source_row(
+        self, initial: bool = False, path: str = "", recursive: bool = True
+    ):
+        """Append a source folder row. The first (initial=True) one cannot
+        be removed. `recursive` controls whether the per-source Sub toggle
+        starts on; defaults to True."""
+        # Wrap each row in a frame so it can carry an alternating-color
+        # background. The frame goes into sources_container; its layout
+        # holds the title (folder custom name), path entry, recursive
+        # toggle, Browse and remove buttons.
+        row_frame = QtWidgets.QFrame()
+        row_frame.setObjectName("source-row")
+        row_layout = QtWidgets.QHBoxLayout(row_frame)
+        row_layout.setContentsMargins(10, 4, 10, 4)
         row_layout.setSpacing(14)
 
+        # Title shows the folder's custom name (renamable via double-click
+        # or the right-click "Rename folder…" menu on the path entry).
         title_widget = _SourceTitle(path, placeholder="Source")
         row_layout.addWidget(title_widget, 0, QtCore.Qt.AlignVCenter)
 
@@ -2061,6 +2369,61 @@ class App(QtWidgets.QMainWindow):
             _e.setText(new_path)
 
         title_widget.rename_done.connect(_on_rename)
+
+        # Right-click on the path entry → context menu with "Rename folder…"
+        # This replaces the double-click-to-rename gesture that used to live
+        # on the (now hidden) title widget. Falls back to the standard
+        # QLineEdit context menu items via the default actions list.
+        entry.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        def _src_entry_menu(pos, _e=entry, _t=title_widget):
+            menu = _e.createStandardContextMenu()
+            menu.addSeparator()
+            rename_act = menu.addAction("Rename folder…")
+            chosen = menu.exec(_e.mapToGlobal(pos))
+            if chosen is rename_act:
+                cur_path = _e.text().strip()
+                if not cur_path or not Path(cur_path).is_dir():
+                    QtWidgets.QMessageBox.information(
+                        self, "Rename folder",
+                        "Pick a valid source folder first."
+                    )
+                    return
+                cur_name = Path(cur_path).name
+                new_name, ok = QtWidgets.QInputDialog.getText(
+                    self, "Rename folder",
+                    f"New name for '{cur_name}':", text=cur_name,
+                )
+                if not ok or not new_name.strip() or new_name.strip() == cur_name:
+                    return
+                # Reuse _SourceTitle's rename pipeline so all the validation
+                # (illegal chars, collision, error popup) stays in one place.
+                _t.setText(new_name.strip())
+                _t._editing = True  # _commit only proceeds when editing
+                _t._commit()
+        entry.customContextMenuRequested.connect(_src_entry_menu)
+
+        # Per-source recursive toggle (replaces the global SEARCH SUBFOLDERS
+        # checkbox). Sits left of Browse so each source can have its own
+        # depth-of-search preference. Icon flips with the state and the CSS
+        # below recolors it (muted gray when off, accent blue when on).
+        recurse_btn = QtWidgets.QPushButton()
+        recurse_btn.setObjectName("source-recurse")
+        recurse_btn.setCheckable(True)
+        recurse_btn.setChecked(recursive)
+        recurse_btn.setFixedSize(48, 44)
+        recurse_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        recurse_btn.setToolTip(
+            "Search subfolders for this source.\n"
+            "↓ (highlighted): walk into every subdirectory.\n"
+            "— : only files directly inside this folder."
+        )
+        _RECURSE_ON, _RECURSE_OFF = "↓", "—"
+
+        def _refresh_recurse_icon(checked, _b=recurse_btn):
+            _b.setText(_RECURSE_ON if checked else _RECURSE_OFF)
+        _refresh_recurse_icon(recurse_btn.isChecked())
+        recurse_btn.toggled.connect(_refresh_recurse_icon)
+        row_layout.addWidget(recurse_btn)
 
         browse = QtWidgets.QPushButton("Browse…")
         browse.setMinimumHeight(44)
@@ -2086,25 +2449,50 @@ class App(QtWidgets.QMainWindow):
             remove_btn.clicked.connect(lambda _=False, e=entry: self._remove_source_row(e))
             row_layout.addWidget(remove_btn)
 
-        self.sources_container.addLayout(row_layout)
+        self.sources_container.addWidget(row_frame)
         self.source_rows.append({
             "layout": row_layout,
+            "frame": row_frame,
             "entry": entry,
             "browse": browse,
             "remove": remove_btn,
             "title": title_widget,
+            "recurse": recurse_btn,
         })
+        self._apply_source_alt_colors()
         # Keep alias to first source for any legacy reads
         if initial:
             self.source_entry = entry
-        # Live save when path is edited
-        if hasattr(self, "_save_timer"):
-            entry.textChanged.connect(self._save_timer.start)
-        # Live auto-scan when path is edited
-        if hasattr(self, "_scan_timer"):
-            entry.textChanged.connect(self._scan_timer.start)
+        # Always route the row's path edits and recurse-toggle through one
+        # method that checks the timers at call time. _build_ui creates the
+        # first source row BEFORE _load_state creates the save/scan timers,
+        # so a hasattr-guarded connect-now approach silently skips the very
+        # first row's signals — meaning the first row's Sub toggle never
+        # persisted across sessions. Lazy routing fixes that.
+        entry.textChanged.connect(self._on_source_changed)
+        recurse_btn.toggled.connect(self._on_source_changed)
 
         return entry
+
+    def _on_source_changed(self, *_):
+        """Per-row source signal handler — triggers a debounced save and
+        an auto-scan. Safe to call before the timers have been created
+        (during _build_ui)."""
+        if hasattr(self, "_save_timer"):
+            self._save_timer.start()
+        if hasattr(self, "_scan_timer"):
+            self._scan_timer.start()
+
+    def _apply_source_alt_colors(self):
+        """Tint each source row's frame with an alternating background so
+        the rows read as distinct rectangles inside the paths card."""
+        EVEN = "QFrame#source-row { background: #161b22; border-radius: 8px; }"
+        ODD  = "QFrame#source-row { background: #1d242e; border-radius: 8px; }"
+        for i, row in enumerate(self.source_rows):
+            frame = row.get("frame")
+            if frame is None:
+                continue
+            frame.setStyleSheet(ODD if i % 2 else EVEN)
 
     def _remove_source_row(self, entry: QtWidgets.QLineEdit):
         for i, row in enumerate(self.source_rows):
@@ -2125,16 +2513,15 @@ class App(QtWidgets.QMainWindow):
             )
             if reply != QtWidgets.QMessageBox.Yes:
                 return
-            while row["layout"].count():
-                item = row["layout"].takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.setParent(None)
-                    w.deleteLater()
-            self.sources_container.removeItem(row["layout"])
-            row["layout"].deleteLater()
+            # Tear down the row's frame (it owns the layout and all widgets).
+            frame = row.get("frame")
+            if frame is not None:
+                self.sources_container.removeWidget(frame)
+                frame.setParent(None)
+                frame.deleteLater()
             self.source_rows.pop(i)
             self._save_state()
+            self._apply_source_alt_colors()
             if hasattr(self, "_scan_timer"):
                 self._scan_timer.start()
             return
@@ -2516,14 +2903,18 @@ class App(QtWidgets.QMainWindow):
             self._scanning = False
 
     def _do_scan(self):
-        sources: list[Path] = []
+        # Each entry is (path, recursive). The per-row Sub toggle replaces
+        # the old global SEARCH SUBFOLDERS option.
+        sources: list[tuple[Path, bool]] = []
         for row in self.source_rows:
             s = row["entry"].text().strip()
             if not s:
                 continue
             p = Path(s)
             if p.is_dir():
-                sources.append(p)
+                rec_btn = row.get("recurse")
+                rec = bool(rec_btn.isChecked()) if rec_btn else True
+                sources.append((p, rec))
             else:
                 self._log(f"Source not a directory (skipped): {s}")
 
@@ -2532,15 +2923,15 @@ class App(QtWidgets.QMainWindow):
             # and let the user fix paths.
             return
 
-        recursive = self.recursive_check.isChecked()
         cross_source = self.cross_source_check.isChecked()
         move_existing = self.move_existing_check.isChecked()
         extract = self.extract_check.isChecked()
 
+        any_recursive = any(rec for _src, rec in sources)
         self.status_label.setText("Scanning…")
         self._log(
             f"Scanning {len(sources)} source(s)"
-            + (" recursively" if recursive else "")
+            + (" recursively" if any_recursive else "")
             + (" with cross-source matching" if cross_source and len(sources) > 1 else "")
             + (" + existing pairs" if move_existing else "")
             + (" + extract archives" if extract else "")
@@ -2548,11 +2939,11 @@ class App(QtWidgets.QMainWindow):
         QtCore.QCoreApplication.processEvents()
 
         if extract:
-            for src in sources:
+            for src, rec in sources:
                 self.status_label.setText(f"Extracting archives in {src.name}…")
                 QtCore.QCoreApplication.processEvents()
                 try:
-                    n = self._extract_archives_in(src, recursive)
+                    n = self._extract_archives_in(src, rec)
                 except OSError as e:
                     self._log(f"  ! couldn't scan archives in {src}: {e}")
                     continue
@@ -2562,9 +2953,9 @@ class App(QtWidgets.QMainWindow):
 
         per_source: list = []  # (src, funscripts, videos)
         all_existing: list[dict] = []
-        for src in sources:
+        for src, rec in sources:
             try:
-                fs, vd, existing = self._gather_files(src, recursive, move_existing)
+                fs, vd, existing = self._gather_files(src, rec, move_existing)
             except OSError as e:
                 self._log(f"  ! couldn't read {src}: {e}")
                 continue
@@ -2573,6 +2964,7 @@ class App(QtWidgets.QMainWindow):
             self._log(
                 f"  {src.name}: {len(fs)} script(s), {len(vd)} video(s)"
                 + (f", {len(existing)} existing pair(s)" if existing else "")
+                + ("" if rec else "  (sub off)")
             )
             QtCore.QCoreApplication.processEvents()
 
@@ -2631,7 +3023,8 @@ class App(QtWidgets.QMainWindow):
                 if paired_ids:
                     rows = [r for r in rows if r["id"] not in paired_ids]
 
-        self.scan_src_paths = sources
+        # Downstream (output-folder fallback, Apply) just needs the paths.
+        self.scan_src_paths = [src for src, _rec in sources]
         self.table.setRowCount(0)
         self.row_widgets = []
 
@@ -2648,17 +3041,36 @@ class App(QtWidgets.QMainWindow):
 
         self._toggle_empty(None)
         threshold = self.min_score_slider.value() / 100.0
-        # Build rows incrementally so Qt can repaint and stay responsive
-        # — for large source folders this would otherwise lock the UI long
-        # enough that Windows flags the app as "Not Responding".
-        total_rows = len(rows)
-        for idx, r in enumerate(rows):
-            self._add_row(r, threshold)
-            if (idx % 8) == 0 or idx == total_rows - 1:
-                self.status_label.setText(
-                    f"Building list… {idx + 1}/{total_rows}"
-                )
-                QtCore.QCoreApplication.processEvents()
+        # Pre-sort the pool by score descending so we never need the
+        # destructive _sort_by_score pass after build. _sort_by_score
+        # reparents every cell widget to a stash and rebuilds the table,
+        # which on large row counts triggers a use-after-free at the C++
+        # level. Sorting the pool data and building in that order gives the
+        # same visual result without touching widgets.
+        rows = sorted(rows, key=self._pool_row_score, reverse=True)
+        self._score_sort = "desc"  # match the pre-sort order
+        # Lazy table build: only construct widgets for rows that pass the
+        # current threshold (plus existing pairs, which are always shown).
+        # When the user lowers the slider, _ensure_rows_for_threshold builds
+        # the rest on demand. At default threshold 1.00 only the handful of
+        # perfect matches are built — no more constructing hundreds of
+        # widgets that would just be hidden.
+        self._pool_rows = list(rows)
+        self._built_row_ids = set()
+        to_build = self._rows_to_build(self._pool_rows, threshold)
+        total_pool = len(self._pool_rows)
+        self.status_label.setText(
+            f"Building {len(to_build)} of {total_pool}…"
+        )
+        self.status_label.repaint()
+        for r in to_build:
+            try:
+                self._add_row(r, threshold)
+                self._built_row_ids.add(r["id"])
+            except Exception as exc:  # noqa: BLE001
+                rid = r.get("id", "?")
+                self._log(f"  ! Couldn't build row '{rid}': {exc}")
+                traceback.print_exc()
 
         total_videos = sum(len(vd) for _src, _fs, vd in per_source)
         matched = sum(
@@ -2672,6 +3084,10 @@ class App(QtWidgets.QMainWindow):
         )
         self.apply_btn.setEnabled(True)
         self._apply_skip_filter()
+        # No _sort_by_score call here — the pool was pre-sorted desc above
+        # so rows already land in score order. Manually re-sort only when
+        # the user clicks the Score header.
+        self._update_score_header()
 
     def _add_row(self, r: dict, threshold: float):
         canonical = r["id"]
@@ -2809,6 +3225,9 @@ class App(QtWidgets.QMainWindow):
             # Flipped True after a successful copy/symlink/hardlink Apply.
             # Done rows stay visible regardless of the min-match threshold.
             "done": False,
+            # Set True if the last Apply attempt failed; right-click → Retry
+            # surfaces this state.
+            "failed": False,
         }
         self.row_widgets.append(row)
 
@@ -2873,15 +3292,19 @@ class App(QtWidgets.QMainWindow):
             return
         threshold = self.min_score_slider.value() / 100.0
         hide_skipped = self.hide_skipped_check.isChecked()
+        show_done = (
+            self.show_done_toggle.isChecked()
+            if hasattr(self, "show_done_toggle") else True
+        )
         for i, row in enumerate(self.row_widgets):
             is_skipped = row["combo"].currentIndex() == 0
             if hide_skipped and is_skipped:
                 visible = False
             elif row.get("done", False):
-                # Already applied (copy/symlink/hardlink) — keep visible so
-                # the user can still see the Done marker, regardless of where
-                # the min-match slider is.
-                visible = True
+                # Already applied (copy/symlink/hardlink). When "Show done"
+                # is on, stays visible regardless of the min-match slider.
+                # When off, the user has explicitly asked to hide done work.
+                visible = show_done
             elif row["is_existing"]:
                 visible = True
             elif row.get("user_picked", False):
@@ -2975,9 +3398,98 @@ class App(QtWidgets.QMainWindow):
             visible_i += 1
         self._alt_dirty = on
 
+    @staticmethod
+    def _pool_row_score(r) -> float:
+        """Score used for pre-sorting pool dicts (not yet built into rows).
+        Mirrors _row_score: existing pairs at 1.0, auto-matched at their
+        auto_score, otherwise -1 (sinks to the bottom under desc sort)."""
+        if r.get("is_existing"):
+            return 1.0
+        if r.get("auto_video"):
+            return r.get("auto_score", 0.0) or 0.0
+        return -1.0
+
+    def _rows_to_build(self, pool, threshold: float):
+        """Subset of the pool whose widgets should exist right now.
+
+        Always-build categories:
+        - existing pairs (locked, always shown)
+        - rows whose auto-score meets the current threshold
+
+        Additionally, when the Show skipped toggle is on we materialise the
+        rest so the (skip)-defaulted rows actually have widgets to show."""
+        show_skipped = (
+            self.show_skipped_toggle.isChecked()
+            if hasattr(self, "show_skipped_toggle") else False
+        )
+        out = []
+        for r in pool:
+            if r["is_existing"]:
+                out.append(r)
+            elif r["auto_video"] and (r["auto_score"] or 0.0) >= threshold:
+                out.append(r)
+            elif show_skipped:
+                # Will display with "(skip)" selected; user asked to see them.
+                out.append(r)
+        return out
+
+    def _ensure_rows_for_threshold(self, threshold: float):
+        """Build widgets for pool rows that should exist at this threshold
+        (or under the current show-skipped setting) but weren't materialized
+        yet. Done in batches via QTimer so Qt can breathe between bursts —
+        large bulk inserts crash QTableWidget on Windows."""
+        if not hasattr(self, "_pool_rows"):
+            return
+        want = self._rows_to_build(self._pool_rows, threshold)
+        pending = [r for r in want if r["id"] not in self._built_row_ids]
+        if not pending:
+            return
+        # Schedule a chunked build. Use an attribute queue so concurrent
+        # slider drags coalesce into one running build.
+        self._pending_build = pending
+        self._pending_threshold = threshold
+        if not getattr(self, "_build_chunk_scheduled", False):
+            self._build_chunk_scheduled = True
+            QtCore.QTimer.singleShot(0, self._build_chunk)
+
+    def _build_chunk(self):
+        """Build a small batch of pending rows, then yield to Qt and
+        reschedule for the next batch. Keeps the UI responsive and avoids
+        Qt's bulk-insert crash on large tables."""
+        self._build_chunk_scheduled = False
+        if not getattr(self, "_pending_build", None):
+            return
+        threshold = getattr(self, "_pending_threshold", 1.0)
+        batch_size = 25
+        batch = self._pending_build[:batch_size]
+        self._pending_build = self._pending_build[batch_size:]
+        for r in batch:
+            if r["id"] in self._built_row_ids:
+                continue
+            try:
+                self._add_row(r, threshold)
+                self._built_row_ids.add(r["id"])
+            except Exception as exc:  # noqa: BLE001
+                rid = r.get("id", "?")
+                self._log(f"  ! Couldn't build row '{rid}': {exc}")
+        if self._pending_build:
+            self._build_chunk_scheduled = True
+            # 30ms gives Qt time to paint/flush its event queue before the
+            # next batch — that breathing room is what prevents the crash.
+            QtCore.QTimer.singleShot(30, self._build_chunk)
+        else:
+            # All built. The pool is pre-sorted desc, so appending to the
+            # table preserves desc order. If the user manually flipped to
+            # asc earlier, the new rows will sit at the bottom — they can
+            # click the Score header again to re-sort.
+            self._reapply_filters()
+
     def _on_min_score_changed(self, value: int):
         threshold = value / 100.0
         self.min_score_label.setText(f"{threshold:.2f}")
+        # Build any new rows that now pass the threshold (no-op if already
+        # built or threshold went up).
+        self._ensure_rows_for_threshold(threshold)
         # Slider movement acts as a "refresh" — wipe all manual-pick flags
         # so the new threshold can re-evaluate every row uniformly.
         for row in self.row_widgets:
@@ -3381,6 +3893,69 @@ class App(QtWidgets.QMainWindow):
                 self._log(f"  ! icon error for {Path(folder).name}: {e}")
         self._log(f"Folder icons: {made}/{total} created.")
 
+    def _on_table_context_menu(self, pos: QtCore.QPoint):
+        """Build a right-click menu for the table row under the cursor.
+        Lets the user retry a failed/normal Apply, toggle skip, or open
+        the source / output folder in Explorer without going through the
+        action buttons."""
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
+            return
+        ri = idx.row()
+        if ri < 0 or ri >= len(self.row_widgets):
+            return
+        row = self.row_widgets[ri]
+
+        menu = QtWidgets.QMenu(self)
+        retry_label = "Retry Apply" if row.get("failed") else "Apply this pair"
+        act_apply = menu.addAction(retry_label)
+        act_apply.setEnabled(row["combo"].currentIndex() != 0)
+
+        # Toggle skip mirrors the per-row Skip button.
+        is_skipped = row["combo"].currentIndex() == 0 or row["skip_btn"].isChecked()
+        act_skip = menu.addAction("Unskip" if is_skipped else "Skip")
+        act_skip.setEnabled(not row["is_existing"])
+
+        menu.addSeparator()
+
+        # Open helpers — useful when an apply failed and the user wants
+        # to inspect the source location.
+        act_open_src = menu.addAction("Open source folder")
+        act_open_out = menu.addAction("Open output folder")
+        out_str = self.output_entry.text().strip()
+        out_path = (Path(out_str) if out_str
+                    else (self.scan_src_paths[0]
+                          if getattr(self, "scan_src_paths", None)
+                          else None))
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_apply:
+            self._apply_single(row)
+        elif chosen is act_skip:
+            row["skip_btn"].setChecked(not row["skip_btn"].isChecked())
+        elif chosen is act_open_src:
+            fs = row["fs_paths"][0] if row["fs_paths"] else None
+            target = fs.parent if fs else None
+            if target and target.exists():
+                self._open_folder(target)
+        elif chosen is act_open_out:
+            if out_path and out_path.exists():
+                self._open_folder(out_path)
+
+    def _open_folder(self, path: Path):
+        """Open `path` in the system file manager."""
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"  ! Couldn't open {path}: {exc}")
+
     def _remove_rows_by_ids(self, ids: set):
         """Drop just the rows whose id is in `ids` from the table, leaving
         every other row (and its current combo selection) untouched. Used
@@ -3560,7 +4135,8 @@ class App(QtWidgets.QMainWindow):
 
         if errors:
             apply_btn.setEnabled(True)
-            apply_btn.setText("Apply")
+            apply_btn.setText("Retry")
+            row["failed"] = True
             QtWidgets.QMessageBox.warning(
                 self, "Issue applying pair", "\n".join(errors[:5])
             )
@@ -3571,6 +4147,7 @@ class App(QtWidgets.QMainWindow):
         # just this row (no re-scan — keeps every other row intact). If we
         # copied/symlinked, the source still exists, so keep the row and mark done.
         self.status_label.setText(f"{op_word} 1 pair.")
+        row["failed"] = False  # clear any prior failure on retry success
         if mode == "move" and row["id"] in succeeded_ids:
             self._remove_rows_by_ids({row["id"]})
             # `row` / `apply_btn` are now deleted — don't touch them again.
