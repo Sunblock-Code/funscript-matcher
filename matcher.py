@@ -2806,6 +2806,9 @@ class App(QtWidgets.QMainWindow):
             # min-match slider no longer auto-hides this row — only a fresh
             # scan resets the flag (rows are rebuilt from scratch on _scan).
             "user_picked": False,
+            # Flipped True after a successful copy/symlink/hardlink Apply.
+            # Done rows stay visible regardless of the min-match threshold.
+            "done": False,
         }
         self.row_widgets.append(row)
 
@@ -2874,6 +2877,11 @@ class App(QtWidgets.QMainWindow):
             is_skipped = row["combo"].currentIndex() == 0
             if hide_skipped and is_skipped:
                 visible = False
+            elif row.get("done", False):
+                # Already applied (copy/symlink/hardlink) — keep visible so
+                # the user can still see the Done marker, regardless of where
+                # the min-match slider is.
+                visible = True
             elif row["is_existing"]:
                 visible = True
             elif row.get("user_picked", False):
@@ -3470,9 +3478,19 @@ class App(QtWidgets.QMainWindow):
         self.status_label.setText(f"{op_word} {succeeded} pair(s). {len(errors)} issue(s).")
         # Only trim the rows that actually moved — never re-scan (that would
         # rebuild the whole list and lose the user's other selections).
-        # Copied/symlinked pairs stay in the list since their sources still exist.
+        # Copied/symlinked pairs stay in the list with a Done marker, and
+        # stay visible regardless of the min-match threshold.
         if mode == "move" and succeeded_ids:
             self._remove_rows_by_ids(succeeded_ids)
+        elif succeeded_ids:
+            for r in self.row_widgets:
+                if r["id"] in succeeded_ids:
+                    r["done"] = True
+                    btn = r.get("apply_btn")
+                    if btn is not None:
+                        btn.setText("Done ✓")
+                        btn.setEnabled(False)
+            self._reapply_filters()
 
     def _apply_single(self, row: dict):
         """Apply (move/copy/symlink) the pair for a single row, using the
@@ -3559,6 +3577,9 @@ class App(QtWidgets.QMainWindow):
         else:
             apply_btn.setText("Done ✓")
             apply_btn.setEnabled(False)
+            row["done"] = True
+            # Done rows stay visible regardless of the min-match threshold.
+            self._reapply_filters()
 
 
 def _make_app_icon() -> QtGui.QIcon:
