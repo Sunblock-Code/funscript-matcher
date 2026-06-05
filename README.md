@@ -1,9 +1,21 @@
 # Funscript Matcher
 
 A native PySide6 / Qt desktop app that pairs funscripts with their matching
-videos across one or more source folders and renames (or moves) them in one
-click. Hardware-accelerated rendering, fuzzy matching, optional archive
-extraction.
+videos across one or more source folders and renames them in one click.
+Hardware-accelerated rendering, fuzzy matching, optional archive extraction.
+
+The **Operation** selector chooses how matched files land in the output folder:
+
+- **Move** — relocate the files (removes them from the source).
+- **Copy** — duplicate the files (uses extra disk space).
+- **Symlink** — create correctly-named links that point back to the originals.
+  No extra disk space and the originals stay put; works with most playback
+  software. On Windows this needs Developer Mode enabled (Settings → Privacy &
+  security → For developers) or running the app as administrator.
+- **Hardlink** — a second name for the same file: no extra disk space, no admin
+  needed, and deleting the source won't break the linked copy (the data lives
+  until the last name is removed). Works for files on the **same drive** only;
+  if a hardlink isn't possible it falls back to a symlink, then to a copy.
 
 ## Requirements
 

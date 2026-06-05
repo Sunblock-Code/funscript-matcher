@@ -37,6 +37,10 @@ ARCHIVE_EXTS = {".zip", ".rar"}
 
 CONFIG_FILE = Path(__file__).parent / "matcher_config.json"
 
+# Folder Icon Maker — reused (lazily imported) to generate per-folder icons
+# from the paired video. Point this at your Folder Icon Maker checkout.
+ICON_MAKER_DIR = Path(r"C:\Users\Gage\Desktop\icons")
+
 
 def _find_7z() -> Path | None:
     """Locate a 7-Zip CLI executable. Used as a fallback when Python's
@@ -153,6 +157,7 @@ QFrame#card {
 
 QLabel#title { font-size: 22px; font-weight: 700; color: #f0f6fc; letter-spacing: -0.01em; }
 QLabel#subtitle { color: #a4abb5; font-size: 13px; }
+QFrame#title-divider { background: #30363d; border: none; }
 QLabel#field-label { color: #f0f6fc; font-size: 17px; font-weight: 700; letter-spacing: 0.2px; background: transparent; }
 QLabel#status { color: #a4abb5; font-size: 13px; }
 QLabel#min-score-label {
@@ -188,6 +193,23 @@ QLineEdit {
 }
 QLineEdit:hover { border-color: #484f58; }
 QLineEdit:focus { border: 1px solid #2f81f7; }
+
+QFrame#folder-field {
+    background: transparent;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+}
+QFrame#folder-field:hover { border-color: #484f58; }
+QFrame#folder-field[focused="true"] { border: 1px solid #2f81f7; }
+QLineEdit#folder-entry {
+    background: transparent;
+    border: none;
+    padding: 11px 0px;
+    color: #f0f6fc;
+    selection-background-color: #2f81f7;
+    font-family: Consolas, monospace;
+    font-size: 15px;
+}
 
 QPushButton {
     background: #22272e;
@@ -286,6 +308,47 @@ QComboBox {
 }
 QComboBox:hover { border-color: #484f58; }
 QComboBox:focus { border: 1px solid #2f81f7; }
+QFrame#op-field {
+    background: #1c2128;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+}
+QLabel#op-label {
+    background: transparent;
+    border: none;
+    border-right: 1px solid #30363d;   /* divider line */
+    padding: 0px 14px;
+    color: #d8dee4;
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel#seg-value {
+    background: transparent;
+    border: none;
+    padding: 0px 16px;
+    color: #79c0ff;
+    font-family: Consolas, "SF Mono", monospace;
+    font-size: 14px;
+    font-weight: 700;
+}
+QFrame#seg-divider {
+    background: #30363d;
+    border: none;
+}
+QFrame#slider-field {
+    background: transparent;
+    border: none;
+}
+QComboBox#op-combo {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    min-height: 22px;
+}
+QComboBox#op-combo:hover { border: none; }
+QComboBox#op-combo:focus { border: none; }
+QComboBox#op-combo::drop-down { border: none; width: 26px; }
 QComboBox::drop-down { border: none; width: 28px; }
 QComboBox QAbstractItemView {
     background: #1c2128;
@@ -592,15 +655,34 @@ QLineEdit#combo-search:focus {
 
 
 class Chip(QtWidgets.QLabel):
+    # When True, chips shade on a smooth yellow→orange→red scale by score
+    # instead of the 3-bucket green/amber/red colors. Toggled app-wide.
+    use_gradient = False
+
     def __init__(self):
         super().__init__()
         self.setFixedSize(64, 28)
         self.setAlignment(QtCore.Qt.AlignCenter)
+        self._score = None
         self.set_score(None)
 
+    @staticmethod
+    def _gradient_colors(score: float) -> tuple[str, str]:
+        """(background, foreground) on a continuous scale: 1.0 → yellow,
+        through orange, down to red at 0.0."""
+        s = max(0.0, min(1.0, float(score)))
+        hue = s * 52.0 / 360.0  # 0=red … 52°=gold-yellow
+        fg = QtGui.QColor.fromHsvF(hue, 0.82, 0.96)
+        bg = QtGui.QColor.fromHsvF(hue, 0.55, 0.22)
+        return bg.name(), fg.name()
+
     def set_score(self, score):
+        self._score = score
         if score is None:
             bg, fg, text = "#30363d", "#a4abb5", "—"
+        elif Chip.use_gradient:
+            bg, fg = self._gradient_colors(score)
+            text = f"{score:.2f}"
         elif score >= 0.7:
             bg, fg, text = "#1a4327", "#56d364", f"{score:.2f}"
         elif score >= 0.4:
@@ -612,6 +694,10 @@ class Chip(QtWidgets.QLabel):
             f"background: {bg}; color: {fg}; "
             f"border-radius: 14px; font-weight: 700; font-size: 13px;"
         )
+
+    def refresh(self):
+        """Re-apply colors for the stored score (after the gradient toggle)."""
+        self.set_score(self._score)
 
 
 class ScoreItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -676,6 +762,243 @@ class _NoWheelComboBox(QtWidgets.QComboBox):
 
     def wheelEvent(self, event):
         event.ignore()
+
+
+def _draw_op_icon(painter: QtGui.QPainter, r: QtCore.QRect, mode: str, color: str):
+    """Draw a small vector icon for an operation mode inside rect `r`. Drawn
+    with primitives (not font glyphs) so it renders identically everywhere."""
+    painter.save()
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    pen = QtGui.QPen(QtGui.QColor(color), 1.6)
+    pen.setCapStyle(QtCore.Qt.RoundCap)
+    pen.setJoinStyle(QtCore.Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(QtCore.Qt.NoBrush)
+    x, y, w, h = r.x(), r.y(), r.width(), r.height()
+    cy = y + h / 2
+    fill = QtGui.QColor(color)
+
+    if mode == "move":  # straight arrow →
+        painter.drawLine(QtCore.QPointF(x + 1, cy), QtCore.QPointF(x + w - 4, cy))
+        painter.setBrush(fill)
+        painter.drawPolygon(QtGui.QPolygonF([
+            QtCore.QPointF(x + w - 5, cy - 4),
+            QtCore.QPointF(x + w - 1, cy),
+            QtCore.QPointF(x + w - 5, cy + 4),
+        ]))
+    elif mode == "copy":  # two overlapping pages
+        painter.drawRoundedRect(QtCore.QRectF(x + 4, y + 2, w - 8, h - 8), 2, 2)
+        painter.drawRoundedRect(QtCore.QRectF(x + 1, y + 5, w - 8, h - 8), 2, 2)
+    elif mode == "link":  # symlink: return/redirect arrow ↪
+        path = QtGui.QPainterPath()
+        path.moveTo(x + 3, y + 2)
+        path.lineTo(x + 3, cy + 2)
+        path.lineTo(x + w - 5, cy + 2)
+        painter.drawPath(path)
+        painter.setBrush(fill)
+        painter.drawPolygon(QtGui.QPolygonF([
+            QtCore.QPointF(x + w - 8, cy - 2),
+            QtCore.QPointF(x + w - 3, cy + 2),
+            QtCore.QPointF(x + w - 8, cy + 6),
+        ]))
+    else:  # hardlink: two interlocking chain rings
+        painter.drawEllipse(QtCore.QRectF(x + 1, y + 4, 8, 8))
+        painter.drawEllipse(QtCore.QRectF(x + w - 9, y + 4, 8, 8))
+    painter.restore()
+
+
+def _paint_op_label(painter, rect, mode, label, color):
+    """Center an icon + uppercase label horizontally within `rect`."""
+    painter.save()
+    f = QtGui.QFont(painter.font())
+    f.setBold(True)
+    painter.setFont(f)
+    fm = QtGui.QFontMetrics(f)
+    icon_w, gap = 16, 8
+    text_w = fm.horizontalAdvance(label)
+    total = icon_w + gap + text_w
+    cx, cy = rect.center().x(), rect.center().y()
+    start_x = int(cx - total / 2)
+    icon_rect = QtCore.QRect(start_x, int(cy - icon_w / 2), icon_w, icon_w)
+    _draw_op_icon(painter, icon_rect, mode, color)
+    text_rect = QtCore.QRect(start_x + icon_w + gap, rect.top(),
+                             text_w + 4, rect.height())
+    painter.setPen(QtGui.QColor(color))
+    painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, label)
+    painter.restore()
+
+
+def _heart_icon(size: int, color: str) -> QtGui.QIcon:
+    """A filled heart drawn as vector art, so it can be sized independently of
+    the button's text font (and stays crisp at any size)."""
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    w = h = size
+    top = h * 0.05
+    bottom = h * 0.95
+    path = QtGui.QPainterPath()
+    path.moveTo(w * 0.5, top + h * 0.22)          # top-center dip
+    path.cubicTo(w * 0.42, top, w * 0.02, top + h * 0.10,
+                 w * 0.06, top + h * 0.42)         # left lobe
+    path.cubicTo(w * 0.10, h * 0.62, w * 0.36, h * 0.78,
+                 w * 0.5, bottom)                  # down to the tip
+    path.cubicTo(w * 0.64, h * 0.78, w * 0.90, h * 0.62,
+                 w * 0.94, top + h * 0.42)         # up the right side
+    path.cubicTo(w * 0.98, top + h * 0.10, w * 0.58, top,
+                 w * 0.5, top + h * 0.22)          # right lobe back to dip
+    p.fillPath(path, QtGui.QColor(color))
+    p.end()
+    return QtGui.QIcon(pm)
+
+
+def _folder_pixmap(size: int, color: str) -> QtGui.QPixmap:
+    """A crisp vector folder, drawn at 2x and tagged high-DPI so it stays
+    sharp (the OS standard folder icon looks blurry when scaled up)."""
+    scale = 2
+    pm = QtGui.QPixmap(size * scale, size * scale)
+    pm.fill(QtCore.Qt.transparent)
+    pm.setDevicePixelRatio(scale)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    w = h = size
+    base = QtGui.QColor(color)
+    lid = QtGui.QColor(color).lighter(118)
+
+    # Back flap with the tab sticking up on the left.
+    flap = QtGui.QPainterPath()
+    flap.moveTo(w * 0.08, h * 0.30)
+    flap.lineTo(w * 0.08, h * 0.26)
+    flap.quadTo(w * 0.08, h * 0.22, w * 0.14, h * 0.22)
+    flap.lineTo(w * 0.36, h * 0.22)
+    flap.lineTo(w * 0.46, h * 0.32)
+    flap.lineTo(w * 0.92, h * 0.32)
+    flap.quadTo(w * 0.96, h * 0.32, w * 0.96, h * 0.36)
+    flap.lineTo(w * 0.96, h * 0.74)
+    flap.quadTo(w * 0.96, h * 0.78, w * 0.92, h * 0.78)
+    flap.lineTo(w * 0.12, h * 0.78)
+    flap.quadTo(w * 0.08, h * 0.78, w * 0.08, h * 0.74)
+    flap.closeSubpath()
+    p.fillPath(flap, lid)
+
+    # Front face, slightly inset, gives the folder a little depth.
+    front = QtGui.QPainterPath()
+    front.addRoundedRect(QtCore.QRectF(w * 0.08, h * 0.40, w * 0.84, h * 0.40),
+                         w * 0.05, w * 0.05)
+    p.fillPath(front, base)
+    p.end()
+    return pm
+
+
+class _FolderField(QtWidgets.QFrame):
+    """A folder-path field: a crisp folder icon + a frameless line edit inside
+    one rounded box. The icon sits inset from the left, and the box highlights
+    its border while the line edit is focused."""
+
+    def __init__(self, entry: QtWidgets.QLineEdit, icon_color: str = "#e3b341"):
+        super().__init__()
+        self.setObjectName("folder-field")
+        self._entry = entry
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(18, 0, 12, 0)
+        lay.setSpacing(14)
+
+        icon = QtWidgets.QLabel()
+        icon.setPixmap(_folder_pixmap(24, icon_color))
+        icon.setFixedSize(24, 24)
+        # The global "QWidget { background: #0d1117 }" rule would otherwise
+        # paint a black square behind the icon — force it transparent.
+        icon.setStyleSheet("background: transparent; border: none;")
+        lay.addWidget(icon, 0, QtCore.Qt.AlignVCenter)
+
+        entry.setObjectName("folder-entry")
+        lay.addWidget(entry, 1)
+        entry.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self._entry and ev.type() in (
+            QtCore.QEvent.FocusIn, QtCore.QEvent.FocusOut,
+        ):
+            self.setProperty("focused", ev.type() == QtCore.QEvent.FocusIn)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        return super().eventFilter(obj, ev)
+
+
+class OperationComboBox(_NoWheelComboBox):
+    """Move / Copy / Symlink / Hardlink selector. Each item is uppercase,
+    horizontally centered, color-coded by mode, with a small vector icon. The
+    collapsed box mirrors the selected item's icon + color."""
+
+    # mode -> subtle accent color
+    COLORS = {
+        "move":     "#79c0ff",   # blue
+        "copy":     "#56d364",   # green
+        "link":     "#d2a8ff",   # purple
+        "hardlink": "#e3b341",   # amber
+    }
+
+    class _Delegate(QtWidgets.QStyledItemDelegate):
+        """Paints each popup row: centered, uppercase, icon + color."""
+
+        def sizeHint(self, option, index):
+            sz = super().sizeHint(option, index)
+            sz.setHeight(max(sz.height(), 30))
+            return sz
+
+        def paint(self, painter, option, index):
+            opt = QtWidgets.QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            label = opt.text.upper()
+            opt.text = ""  # draw row chrome (hover/selection) without text
+            widget = opt.widget
+            style = widget.style() if widget else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, widget)
+
+            mode = index.data(QtCore.Qt.UserRole)
+            selected = bool(option.state & QtWidgets.QStyle.State_Selected)
+            color = "#ffffff" if selected else OperationComboBox.COLORS.get(mode, "#f0f6fc")
+            painter.setFont(option.font)
+            _paint_op_label(painter, option.rect, mode, label, color)
+
+    def __init__(self):
+        super().__init__()
+        self.setItemDelegate(self._Delegate(self))
+
+    def _content_width(self) -> int:
+        """Widest item as actually drawn: icon + gap + bold uppercase label."""
+        f = QtGui.QFont(self.font())
+        f.setBold(True)
+        fm = QtGui.QFontMetrics(f)
+        icon_w, gap = 16, 8
+        widest = 0
+        for i in range(self.count()):
+            widest = max(widest, fm.horizontalAdvance(self.itemText(i).upper()))
+        return icon_w + gap + widest
+
+    def sizeHint(self):
+        sh = super().sizeHint()
+        # content + dropdown arrow (~28) + left/right padding (~24) + slack
+        sh.setWidth(self._content_width() + 28 + 24 + 8)
+        return sh
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def paintEvent(self, event):
+        painter = QtWidgets.QStylePainter(self)
+        opt = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = ""  # suppress the default left-aligned label
+        painter.drawComplexControl(QtWidgets.QStyle.CC_ComboBox, opt)
+
+        mode = self.currentData()
+        color = self.COLORS.get(mode, "#f0f6fc")
+        # Center the icon + label within the combo's full shape (not just the
+        # edit-field rect, which excludes the arrow and looks left-shifted).
+        painter.setFont(self.font())
+        _paint_op_label(painter, self.rect(), mode, self.currentText().upper(), color)
 
 
 class _SearchableComboBox(_NoWheelComboBox):
@@ -956,40 +1279,45 @@ class App(QtWidgets.QMainWindow):
         # can be collapsed in compact mode)
         self._title_widget = QtWidgets.QWidget()
         title_row = QtWidgets.QHBoxLayout(self._title_widget)
-        title_row.setContentsMargins(0, 0, 0, 0)
-        title_box = QtWidgets.QVBoxLayout()
-        title_box.setSpacing(2)
-        title_box.setContentsMargins(0, 0, 0, 6)
+        title_row.setContentsMargins(0, 0, 0, 6)
+        title_row.setSpacing(14)
+        # Title, a vertical divider, then the subtitle to its right (saves the
+        # vertical space the stacked subtitle used to take).
         t = QtWidgets.QLabel("Funscript Matcher"); t.setObjectName("title")
+        title_row.addWidget(t, 0, QtCore.Qt.AlignVCenter)
+        title_div = QtWidgets.QFrame(); title_div.setObjectName("title-divider")
+        title_div.setFixedSize(1, 26)
+        title_row.addWidget(title_div, 0, QtCore.Qt.AlignVCenter)
         s = QtWidgets.QLabel("Pair scripts with videos and rename in one click")
         s.setObjectName("subtitle")
-        title_box.addWidget(t)
-        title_box.addWidget(s)
-        title_row.addLayout(title_box)
+        title_row.addWidget(s, 0, QtCore.Qt.AlignVCenter)
         title_row.addStretch()
 
-        self.donate_btn = QtWidgets.QPushButton("♥  Donate")
-        self.donate_btn.setObjectName("donate-btn")
-        self.donate_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.donate_btn.setMinimumHeight(34)
-        self.donate_btn.clicked.connect(self._show_donate)
-        title_row.addWidget(self.donate_btn, 0, QtCore.Qt.AlignTop)
+        # Donate and Log share one exact box size so their outlines line up.
+        _btn_size = QtCore.QSize(120, 36)
 
-        self.log_toggle_btn = QtWidgets.QPushButton("Log  ▸")
+        self.donate_btn = QtWidgets.QPushButton("DONATE")
+        self.donate_btn.setObjectName("donate-btn")
+        self.donate_btn.setIcon(_heart_icon(18, "#e0709a"))
+        self.donate_btn.setIconSize(QtCore.QSize(18, 18))
+        self.donate_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.donate_btn.setFixedSize(_btn_size)
+        self.donate_btn.clicked.connect(self._show_donate)
+        title_row.addWidget(self.donate_btn, 0, QtCore.Qt.AlignVCenter)
+
+        self.log_toggle_btn = QtWidgets.QPushButton("LOG  ▸")
         self.log_toggle_btn.setObjectName("log-toggle")
         self.log_toggle_btn.setCheckable(True)
         self.log_toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.log_toggle_btn.setMinimumHeight(34)
-        self.log_toggle_btn.setMinimumWidth(82)
+        self.log_toggle_btn.setFixedSize(_btn_size)
         self.log_toggle_btn.clicked.connect(self._toggle_log_panel)
-        title_row.addWidget(self.log_toggle_btn, 0, QtCore.Qt.AlignTop)
+        title_row.addWidget(self.log_toggle_btn, 0, QtCore.Qt.AlignVCenter)
 
         L.addWidget(self._title_widget)
 
         # Splitter `self._main_splitter` is used later to attach the log panel.
 
         # Paths card with dynamic sources + single output
-        self._folder_icon = self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon)
         self.source_rows: list[dict] = []
 
         paths_card = QtWidgets.QFrame(); paths_card.setObjectName("card")
@@ -1031,8 +1359,7 @@ class App(QtWidgets.QMainWindow):
         self.output_entry = QtWidgets.QLineEdit()
         self.output_entry.setPlaceholderText("Leave blank to use the first source folder")
         self.output_entry.setMinimumHeight(44)
-        self.output_entry.addAction(self._folder_icon, QtWidgets.QLineEdit.LeadingPosition)
-        out_row.addWidget(self.output_entry, 1)
+        out_row.addWidget(_FolderField(self.output_entry), 1)
 
         self.output_entry.textChanged.connect(
             lambda t, w=self.output_title: w.set_path(t.strip())
@@ -1065,72 +1392,134 @@ class App(QtWidgets.QMainWindow):
         # rows. Wrapped in a widget so we can collapse it in compact mode.
         self._opts_widget = QtWidgets.QWidget()
         opts = QtWidgets.QGridLayout(self._opts_widget)
-        opts.setHorizontalSpacing(22)
-        opts.setVerticalSpacing(10)
+        opts.setHorizontalSpacing(18)
+        opts.setVerticalSpacing(18)  # equal gaps left/right and up/down
         opts.setContentsMargins(0, 0, 0, 0)
 
-        self.move_check = QtWidgets.QCheckBox("Move (instead of copy)")
-        self.move_check.setChecked(True)
-        opts.addWidget(self.move_check, 0, 0)
+        # Operation selector: one rounded box split by a divider line —
+        # "Operation" label on the left, the mode combo on the right.
+        op_field = QtWidgets.QFrame()
+        op_field.setObjectName("op-field")
+        op_field.setFixedHeight(40)
+        ofl = QtWidgets.QHBoxLayout(op_field)
+        ofl.setContentsMargins(0, 0, 0, 0)
+        ofl.setSpacing(0)
 
-        self.auto_check = QtWidgets.QCheckBox("Auto-pair 100% matches")
+        op_label = QtWidgets.QLabel("OPERATION")
+        op_label.setObjectName("op-label")
+        op_label.setAlignment(QtCore.Qt.AlignCenter)
+        ofl.addWidget(op_label)
+
+        self.op_mode_combo = OperationComboBox()
+        self.op_mode_combo.setObjectName("op-combo")
+        self.op_mode_combo.addItem("Move", "move")
+        self.op_mode_combo.addItem("Copy", "copy")
+        self.op_mode_combo.addItem("Symlink", "link")
+        self.op_mode_combo.addItem("Hardlink", "hardlink")
+        self.op_mode_combo.setCurrentIndex(0)  # default: Move
+        self.op_mode_combo.setToolTip(
+            "Move: relocate files into the output folder (removes the source).\n"
+            "Copy: duplicate files (uses extra disk space).\n"
+            "Symlink: create links named to match, pointing back to the "
+            "originals — no extra space and the originals stay put.\n"
+            "On Windows, symlinks need Developer Mode or running as admin.\n"
+            "Hardlink: a second name for the same file — no extra space, no "
+            "admin needed, and deleting the source won't break it. Same drive "
+            "only; falls back to symlink/copy if not possible."
+        )
+        ofl.addWidget(self.op_mode_combo)
+        # Operation lives in the action row (left of Min match), not this grid.
+        self._op_field = op_field
+
+        self.auto_check = QtWidgets.QCheckBox("AUTO-PAIR 100% MATCHES")
         self.auto_check.setToolTip("On scan, pair anything with a perfect score automatically.")
-        opts.addWidget(self.auto_check, 0, 1)
+        opts.addWidget(self.auto_check, 0, 0)
 
-        self.hide_skipped_check = QtWidgets.QCheckBox("Hide skipped")
+        self.hide_skipped_check = QtWidgets.QCheckBox("HIDE SKIPPED")
         self.hide_skipped_check.setToolTip("Hide rows currently set to (skip).")
         self.hide_skipped_check.toggled.connect(self._apply_skip_filter)
-        opts.addWidget(self.hide_skipped_check, 0, 2)
+        opts.addWidget(self.hide_skipped_check, 0, 1)
 
-        self.alt_colors_check = QtWidgets.QCheckBox("Alternate row colors")
+        self.alt_colors_check = QtWidgets.QCheckBox("ALTERNATE ROW COLORS")
         self.alt_colors_check.setToolTip("Tint every other row for easier reading.")
         self.alt_colors_check.toggled.connect(lambda _: self._apply_alt_colors())
-        opts.addWidget(self.alt_colors_check, 0, 3)
+        opts.addWidget(self.alt_colors_check, 0, 2)
 
-        self.recursive_check = QtWidgets.QCheckBox("Search subfolders")
+        self.recursive_check = QtWidgets.QCheckBox("SEARCH SUBFOLDERS")
         self.recursive_check.setToolTip(
             "Recurse into subdirectories. Folders that already look paired are left alone."
         )
         opts.addWidget(self.recursive_check, 1, 0)
 
-        self.cross_source_check = QtWidgets.QCheckBox("Match across source folders")
+        self.cross_source_check = QtWidgets.QCheckBox("MATCH ACROSS SOURCE FOLDERS")
         self.cross_source_check.setToolTip(
             "Allow scripts in one source folder to pair with videos in another."
         )
         opts.addWidget(self.cross_source_check, 1, 1)
 
-        self.move_existing_check = QtWidgets.QCheckBox("Move existing paired subfolders")
+        self.move_existing_check = QtWidgets.QCheckBox("MOVE EXISTING PAIRED SUBFOLDERS")
         self.move_existing_check.setToolTip(
             "Also relocate already-paired subfolders inside the source(s) into the output folder."
         )
         opts.addWidget(self.move_existing_check, 1, 2)
 
-        self.extract_check = QtWidgets.QCheckBox("Extract archives")
+        self.extract_check = QtWidgets.QCheckBox("EXTRACT ARCHIVES")
         rar_note = "" if _HAS_RAR else "  (RAR needs: pip install rarfile)"
         self.extract_check.setToolTip(
             "Auto-extract .zip / .rar files in the source(s) into a folder named after the "
             "archive, then delete the original archive." + rar_note
         )
         self.extract_check.setChecked(True)
-        opts.addWidget(self.extract_check, 1, 3)
+        opts.addWidget(self.extract_check, 2, 0)
 
-        # Trailing column eats remaining space so columns stay tight on the left
-        opts.setColumnStretch(4, 1)
+        self.score_color_check = QtWidgets.QCheckBox("COLOR-CODE SCORES")
+        self.score_color_check.setToolTip(
+            "Shade each score chip on a smooth scale — yellow for the strongest "
+            "matches, through orange, down to red for the weakest."
+        )
+        self.score_color_check.toggled.connect(self._on_score_color_toggled)
+        opts.addWidget(self.score_color_check, 2, 1)
+
+        self.icon_check = QtWidgets.QCheckBox("CREATE FOLDER ICONS")
+        self.icon_check.setToolTip(
+            "After pairing, generate a rounded folder icon from each video frame "
+            "so Explorer shows a thumbnail (writes video-icon.ico + desktop.ini).\n"
+            f"Uses the Folder Icon Maker at {ICON_MAKER_DIR} and needs FFmpeg + "
+            "ImageMagick configured there."
+        )
+        opts.addWidget(self.icon_check, 2, 2)
+
+        # Three checkbox columns share the width evenly.
+        opts.setColumnStretch(0, 1)
+        opts.setColumnStretch(1, 1)
+        opts.setColumnStretch(2, 1)
         L.addWidget(self._opts_widget)
 
-        # Action row: min-match slider + Scan
+        # Action row: Operation box · Min-match box · slider · Scan
         action_row = QtWidgets.QHBoxLayout()
         action_row.setSpacing(14)
 
-        min_match_text = QtWidgets.QLabel("Min match")
-        min_match_text.setObjectName("min-score-label")
-        action_row.addWidget(min_match_text)
+        # Operation segmented box on the left.
+        action_row.addWidget(self._op_field, 0, QtCore.Qt.AlignVCenter)
 
+        # Min match — a segmented box (label | value with divider), same shape
+        # as Operation.
+        mm_field = QtWidgets.QFrame()
+        mm_field.setObjectName("op-field")
+        mm_field.setFixedHeight(40)
+        mml = QtWidgets.QHBoxLayout(mm_field)
+        mml.setContentsMargins(0, 0, 0, 0)
+        mml.setSpacing(0)
+        min_match_text = QtWidgets.QLabel("MIN MATCH")
+        min_match_text.setObjectName("op-label")
+        min_match_text.setAlignment(QtCore.Qt.AlignCenter)
+        mml.addWidget(min_match_text)
         self.min_score_label = QtWidgets.QLabel("1.00")
-        self.min_score_label.setObjectName("min-score-chip")
+        self.min_score_label.setObjectName("seg-value")
         self.min_score_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.min_score_label.setMinimumWidth(58)
-        action_row.addWidget(self.min_score_label)
+        self.min_score_label.setMinimumWidth(64)
+        mml.addWidget(self.min_score_label)
+        action_row.addWidget(mm_field, 0, QtCore.Qt.AlignVCenter)
 
         self.min_score_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.min_score_slider.setRange(0, 100)
@@ -1192,6 +1581,7 @@ class App(QtWidgets.QMainWindow):
         self.table.setTextElideMode(QtCore.Qt.ElideRight)
 
         hh = self.table.horizontalHeader()
+        hh.setDefaultAlignment(QtCore.Qt.AlignCenter | QtCore.Qt.AlignVCenter)
         hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
@@ -1296,7 +1686,7 @@ class App(QtWidgets.QMainWindow):
         visible = not self.log_panel.isVisible()
         self.log_panel.setVisible(visible)
         self.log_toggle_btn.setChecked(visible)
-        self.log_toggle_btn.setText("Log  ▾" if visible else "Log  ▸")
+        self.log_toggle_btn.setText("LOG  ▾" if visible else "LOG  ▸")
         if visible:
             # Defer the splitter sizing until after the event loop has had a
             # chance to paint — at startup the splitter has no real width yet
@@ -1518,8 +1908,14 @@ class App(QtWidgets.QMainWindow):
 
         if cfg.get("output"):
             self.output_entry.setText(cfg["output"])
-        if "move" in cfg:
-            self.move_check.setChecked(bool(cfg["move"]))
+        if cfg.get("op_mode") in ("move", "copy", "link", "hardlink"):
+            idx = self.op_mode_combo.findData(cfg["op_mode"])
+            if idx >= 0:
+                self.op_mode_combo.setCurrentIndex(idx)
+        elif "move" in cfg:  # back-compat with older configs (bool)
+            idx = self.op_mode_combo.findData("move" if cfg["move"] else "copy")
+            if idx >= 0:
+                self.op_mode_combo.setCurrentIndex(idx)
         if "auto" in cfg:
             self.auto_check.setChecked(bool(cfg["auto"]))
         if "hide_skipped" in cfg:
@@ -1534,6 +1930,10 @@ class App(QtWidgets.QMainWindow):
             self.extract_check.setChecked(bool(cfg["extract"]))
         if "alt_colors" in cfg:
             self.alt_colors_check.setChecked(bool(cfg["alt_colors"]))
+        if "score_color" in cfg:
+            self.score_color_check.setChecked(bool(cfg["score_color"]))
+        if "make_icons" in cfg:
+            self.icon_check.setChecked(bool(cfg["make_icons"]))
         if cfg.get("log_visible"):
             self._toggle_log_panel()
         if cfg.get("compact"):
@@ -1549,7 +1949,7 @@ class App(QtWidgets.QMainWindow):
             row["entry"].textChanged.connect(self._save_timer.start)
             row["entry"].textChanged.connect(self._scan_timer.start)
         self.output_entry.textChanged.connect(self._save_timer.start)
-        self.move_check.toggled.connect(self._save_state)
+        self.op_mode_combo.currentIndexChanged.connect(self._save_state)
         self.auto_check.toggled.connect(self._save_state)
         self.hide_skipped_check.toggled.connect(self._save_state)
         self.recursive_check.toggled.connect(self._save_state)
@@ -1557,6 +1957,7 @@ class App(QtWidgets.QMainWindow):
         self.move_existing_check.toggled.connect(self._save_state)
         self.extract_check.toggled.connect(self._save_state)
         self.alt_colors_check.toggled.connect(self._save_state)
+        self.icon_check.toggled.connect(self._save_state)
         # Not saving min_score — it's a per-session setting (see _load_state).
         # Options that affect which pairs are produced auto-rescan immediately.
         self.recursive_check.toggled.connect(lambda _: self._scan_timer.start())
@@ -1582,7 +1983,8 @@ class App(QtWidgets.QMainWindow):
             "sources": sources,
             "source": sources[0] if sources else "",  # back-compat with older readers
             "output": self.output_entry.text(),
-            "move": self.move_check.isChecked(),
+            "op_mode": self._op_mode(),
+            "move": self._op_mode() == "move",  # back-compat with older readers
             "auto": self.auto_check.isChecked(),
             "hide_skipped": self.hide_skipped_check.isChecked(),
             "recursive": self.recursive_check.isChecked(),
@@ -1590,6 +1992,8 @@ class App(QtWidgets.QMainWindow):
             "move_existing": self.move_existing_check.isChecked(),
             "extract": self.extract_check.isChecked(),
             "alt_colors": self.alt_colors_check.isChecked() if hasattr(self, "alt_colors_check") else False,
+            "score_color": self.score_color_check.isChecked() if hasattr(self, "score_color_check") else False,
+            "make_icons": self.icon_check.isChecked() if hasattr(self, "icon_check") else False,
             "log_visible": self.log_panel.isVisible() if hasattr(self, "log_panel") else False,
             "compact": self.compact_btn.isChecked() if hasattr(self, "compact_btn") else False,
         })
@@ -1644,8 +2048,7 @@ class App(QtWidgets.QMainWindow):
             if initial else "Additional source folder"
         )
         entry.setMinimumHeight(44)
-        entry.addAction(self._folder_icon, QtWidgets.QLineEdit.LeadingPosition)
-        row_layout.addWidget(entry, 1)
+        row_layout.addWidget(_FolderField(entry), 1)
 
         entry.textChanged.connect(
             lambda t, w=title_widget: w.set_path(t.strip())
@@ -2201,7 +2604,7 @@ class App(QtWidgets.QMainWindow):
         # Auto-pair perfect matches (≥0.999 score). Existing pairs always qualify.
         out_str = self.output_entry.text().strip()
         out = Path(out_str) if out_str else sources[0]
-        move = self.move_check.isChecked()
+        mode = self._op_mode()
 
         auto_paired = 0
         if self.auto_check.isChecked():
@@ -2217,11 +2620,13 @@ class App(QtWidgets.QMainWindow):
             if perfect:
                 self.status_label.setText(f"Auto-pairing {len(perfect)} perfect match(es)…")
                 QtCore.QCoreApplication.processEvents()
-                paired_ids, errs = self._do_pair(out, move, perfect)
+                paired_ids, errs = self._do_pair(out, mode, perfect)
                 auto_paired = len(paired_ids)
                 self._log(f"Auto-paired {auto_paired}/{len(perfect)} perfect match(es).")
                 for e in errs:
                     self._log(f"  ! {e}")
+                if paired_ids and self.icon_check.isChecked():
+                    self._make_folder_icons(self._last_pair_folders)
                 if paired_ids:
                     rows = [r for r in rows if r["id"] not in paired_ids]
 
@@ -2448,6 +2853,13 @@ class App(QtWidgets.QMainWindow):
         # _reapply_filters which handles skip + threshold + user-picked.
         self._reapply_filters()
 
+    def _on_score_color_toggled(self, on: bool):
+        """Switch all score chips between the gradient scale and the buckets."""
+        Chip.use_gradient = bool(on)
+        for r in self.row_widgets:
+            r["chip"].refresh()
+        self._save_state()
+
     def _reapply_filters(self):
         """Decide row visibility from the score threshold, hide-skipped
         toggle, and the per-row user_picked flag (set when the user picks
@@ -2612,10 +3024,90 @@ class App(QtWidgets.QMainWindow):
         except OSError:
             return None
 
-    def _do_pair(self, out: Path, move: bool, pairs: list) -> tuple[set, list]:
-        """Move or copy each pair. Two pair shapes are accepted:
-          - Regular: {"id", "fs_paths": [Path], "video_path": Path} → move/copy into out/{id}/
-          - Existing: {"id", "subfolder": Path}                     → move/copy whole subfolder into out/
+    def _op_mode(self) -> str:
+        """Current file-operation mode: 'move', 'copy', or 'link'."""
+        return self.op_mode_combo.currentData() or "move"
+
+    @staticmethod
+    def _op_words(mode: str) -> tuple[str, str, str]:
+        """(verb, present-progressive, past) words for status/log messages."""
+        return {
+            "move": ("Move", "Moving", "Moved"),
+            "copy": ("Copy", "Copying", "Copied"),
+            "link": ("Symlink", "Linking", "Linked"),
+            "hardlink": ("Hardlink", "Hardlinking", "Hardlinked"),
+        }[mode]
+
+    @staticmethod
+    def _symlink(src: str, dst: str):
+        """Create a symlink at `dst` pointing to `src` (absolute target so the
+        link resolves no matter the working directory). Signature mirrors
+        shutil.move/copy2 so it can be used interchangeably as `op`."""
+        Path(dst).symlink_to(Path(src).resolve())
+
+    def _hardlink(self, src: str, dst: str):
+        """Create a hardlink at `dst` for the file `src` — a second name for
+        the same data (no extra space, survives deleting the source). Hardlinks
+        only work for files on the same volume, so fall back gracefully:
+        hardlink → symlink → copy. Signature mirrors `op`."""
+        try:
+            Path(dst).hardlink_to(src)
+            return
+        except OSError:
+            pass  # cross-volume or unsupported — try the next best thing
+        try:
+            self._symlink(src, dst)
+            self._log(f"  (hardlink not possible, used symlink: {Path(dst).name})")
+            return
+        except OSError:
+            pass
+        shutil.copy2(src, dst)
+        self._log(f"  (hardlink/symlink not possible, copied: {Path(dst).name})")
+
+    def _hardlink_tree(self, src: Path, dst: Path):
+        """Recreate `src`'s folder structure under `dst`, hardlinking each file
+        (directories can't be hardlinked, so we mirror the tree and link the
+        files inside, with the same per-file fallback as _hardlink)."""
+        dst.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            child = dst / item.name
+            if item.is_dir():
+                self._hardlink_tree(item, child)
+            else:
+                self._hardlink(str(item), str(child))
+
+    def _symlink_capable(self, out: Path) -> tuple[bool, str]:
+        """Probe whether symlinks can actually be created under `out`. On
+        Windows this fails without Developer Mode / admin, so we check once
+        up front and return a clear message instead of N cryptic per-file
+        errors."""
+        target = out / ".__fsm_symtest_target"
+        link = out / ".__fsm_symtest_link"
+        try:
+            for p in (link, target):
+                if p.is_symlink() or p.exists():
+                    p.unlink()
+            target.write_text("")
+            link.symlink_to(target)
+            return True, ""
+        except OSError as e:
+            return False, (
+                f"Symlinks aren't available in '{out}': {e}. On Windows, "
+                "enable Developer Mode (Settings → Privacy & security → For "
+                "developers) or run this app as administrator."
+            )
+        finally:
+            for p in (link, target):
+                try:
+                    if p.is_symlink() or p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+
+    def _do_pair(self, out: Path, mode: str, pairs: list) -> tuple[set, list]:
+        """Move, copy, or symlink each pair (per `mode`). Two pair shapes:
+          - Regular: {"id", "fs_paths": [Path], "video_path": Path} → into out/{id}/
+          - Existing: {"id", "subfolder": Path}                     → whole subfolder into out/
 
         When the destination already exists, we compare every file by size:
           - All sizes match  → MERGE (drop the loose source if moving, no-op if copying).
@@ -2629,15 +3121,29 @@ class App(QtWidgets.QMainWindow):
         except OSError as e:
             return succeeded_ids, [f"Couldn't create output folder: {e}"]
 
-        op = shutil.move if move else shutil.copy2
+        if mode == "link":
+            ok, why = self._symlink_capable(out)
+            if not ok:
+                return succeeded_ids, [why]
+
+        if mode == "move":
+            op = shutil.move
+        elif mode == "copy":
+            op = shutil.copy2
+        elif mode == "hardlink":
+            op = self._hardlink
+        else:  # link (symlink)
+            op = self._symlink
+        _, ing, _past = self._op_words(mode)
         errors: list[str] = []
         claimed: set = set()
+        dest_folders: list[Path] = []  # final folder per successful pair (for icons)
         total_pairs = len(pairs)
 
         for pair_idx, m in enumerate(pairs):
             if hasattr(self, "status_label") and total_pairs > 1:
                 self.status_label.setText(
-                    f"{'Moving' if move else 'Copying'} pair {pair_idx + 1}/{total_pairs}…"
+                    f"{ing} pair {pair_idx + 1}/{total_pairs}…"
                 )
                 QtCore.QCoreApplication.processEvents()
             canonical = m["id"]
@@ -2648,6 +3154,7 @@ class App(QtWidgets.QMainWindow):
                 target = out / sub.name
                 if self._same_path(target, sub):
                     succeeded_ids.add(canonical)
+                    dest_folders.append(target)
                     continue
 
                 if target.exists():
@@ -2663,7 +3170,7 @@ class App(QtWidgets.QMainWindow):
                     )
 
                     if contents_match:
-                        if move:
+                        if mode == "move":
                             try:
                                 shutil.rmtree(str(sub))
                             except OSError as e:
@@ -2671,6 +3178,7 @@ class App(QtWidgets.QMainWindow):
                                 continue
                         self._log(f"Merged identical: {sub.name}/")
                         succeeded_ids.add(canonical)
+                        dest_folders.append(target)
                         continue
 
                     renamed = self._next_available(target)
@@ -2678,11 +3186,19 @@ class App(QtWidgets.QMainWindow):
                     target = renamed
 
                 try:
-                    if move:
+                    if mode == "move":
                         shutil.move(str(sub), str(target))
-                    else:
+                    elif mode == "copy":
                         shutil.copytree(str(sub), str(target))
+                    elif mode == "hardlink":
+                        # Can't hardlink a folder — mirror it and link the files.
+                        self._hardlink_tree(sub, Path(target))
+                    else:  # link the whole subfolder
+                        Path(target).symlink_to(
+                            sub.resolve(), target_is_directory=True
+                        )
                     succeeded_ids.add(canonical)
+                    dest_folders.append(target)
                 except (OSError, shutil.Error) as e:
                     errors.append(f"{canonical}: {e}")
                 continue
@@ -2721,7 +3237,7 @@ class App(QtWidgets.QMainWindow):
                         break
 
                 if all_match:
-                    if move:
+                    if mode == "move":
                         for src_p, dst_name in plan:
                             dst_p = target_dir / dst_name
                             if self._same_path(dst_p, src_p):
@@ -2735,6 +3251,7 @@ class App(QtWidgets.QMainWindow):
                                 )
                     self._log(f"Merged identical: {canonical}/")
                     succeeded_ids.add(canonical)
+                    dest_folders.append(target_dir)
                     continue
 
                 renamed = self._next_available(target_dir)
@@ -2777,8 +3294,83 @@ class App(QtWidgets.QMainWindow):
                     continue
 
             succeeded_ids.add(canonical)
+            dest_folders.append(target_dir)
 
+        self._last_pair_folders = dest_folders
         return succeeded_ids, errors
+
+    def _load_icon_maker(self):
+        """Lazily import the Folder Icon Maker module (ICONS.py), cached.
+        Returns the module, or None (with a one-time message) if unavailable.
+        Its GUI is guarded under __main__, so importing is side-effect light."""
+        if hasattr(self, "_icon_maker"):
+            return self._icon_maker
+        self._icon_maker = None
+        icons_py = ICON_MAKER_DIR / "ICONS.py"
+        if not icons_py.exists():
+            QtWidgets.QMessageBox.information(
+                self, "Folder icons",
+                f"Couldn't find the Folder Icon Maker at:\n{icons_py}\n\n"
+                "Folder-icon creation is disabled.")
+            return None
+        try:
+            import importlib.util
+            if str(ICON_MAKER_DIR) not in sys.path:
+                sys.path.insert(0, str(ICON_MAKER_DIR))
+            spec = importlib.util.spec_from_file_location(
+                "folder_icon_maker", str(icons_py))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self._icon_maker = mod
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Folder icons",
+                f"Couldn't load the Folder Icon Maker:\n{e}\n\n"
+                "Folder-icon creation is disabled.")
+        return self._icon_maker
+
+    def _make_folder_icons(self, folders: list) -> None:
+        """Generate a rounded folder icon (from the paired video) for each
+        folder, reusing the Folder Icon Maker pipeline. Degrades gracefully if
+        the module or FFmpeg/ImageMagick aren't available."""
+        folders = [f for f in (folders or []) if f and Path(f).is_dir()]
+        if not folders:
+            return
+        icons = self._load_icon_maker()
+        if icons is None:
+            return
+        cfg = icons._load_cfg()
+        ffmpeg = cfg.get("ffmpeg_path", "")
+        magick = cfg.get("magick_path", "")
+        ffprobe = ffmpeg.replace("ffmpeg.exe", "ffprobe.exe")
+        if not (Path(ffmpeg).exists() and Path(magick).exists()):
+            msg = ("Folder icons skipped — FFmpeg/ImageMagick not found. Set "
+                   "their paths in the Folder Icon Maker first.")
+            self._log("  ! " + msg)
+            QtWidgets.QMessageBox.information(self, "Folder icons", msg)
+            return
+
+        def _icon_log(text, level=None):
+            self._log(f"  icon: {text}")
+
+        total = len(folders)
+        made = 0
+        for i, folder in enumerate(folders):
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Making folder icon {i + 1}/{total}…")
+                QtCore.QCoreApplication.processEvents()
+            try:
+                status, _final, reason = icons.process_folder(
+                    str(folder), ffmpeg, magick, ffprobe, _icon_log,
+                    skip_existing=False, save_alternates=False,
+                )
+                if status == "ok":
+                    made += 1
+                elif status == "err":
+                    self._log(f"  ! icon failed for {Path(folder).name}: {reason}")
+            except Exception as e:
+                self._log(f"  ! icon error for {Path(folder).name}: {e}")
+        self._log(f"Folder icons: {made}/{total} created.")
 
     def _remove_rows_by_ids(self, ids: set):
         """Drop just the rows whose id is in `ids` from the table, leaving
@@ -2806,7 +3398,8 @@ class App(QtWidgets.QMainWindow):
             return
         out_str = self.output_entry.text().strip()
         out = Path(out_str) if out_str else self.scan_src_paths[0]
-        move = self.move_check.isChecked()
+        mode = self._op_mode()
+        _verb, ing, past = self._op_words(mode)
         self._save_state()
 
         selected: list[dict] = []
@@ -2834,7 +3427,7 @@ class App(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Nothing to do", "No videos selected.")
             return
 
-        if move:
+        if mode == "move":
             ans = QtWidgets.QMessageBox.question(
                 self, "Confirm move",
                 f"Move {len(selected)} pair(s) into:\n{out}\n\n"
@@ -2846,19 +3439,22 @@ class App(QtWidgets.QMainWindow):
 
         self.apply_btn.setEnabled(False)
         self.apply_btn.setText("Working…")
-        self.status_label.setText(f"{'Moving' if move else 'Copying'} {len(selected)} pair(s)…")
-        self._log(f"{'Moving' if move else 'Copying'} {len(selected)} pair(s) → {out}")
+        self.status_label.setText(f"{ing} {len(selected)} pair(s)…")
+        self._log(f"{ing} {len(selected)} pair(s) → {out}")
         QtCore.QCoreApplication.processEvents()
 
-        succeeded_ids, errors = self._do_pair(out, move, selected)
+        succeeded_ids, errors = self._do_pair(out, mode, selected)
         succeeded = len(succeeded_ids)
-        self._log(f"{'Moved' if move else 'Copied'} {succeeded}/{len(selected)} pair(s). {len(errors)} issue(s).")
+        self._log(f"{past} {succeeded}/{len(selected)} pair(s). {len(errors)} issue(s).")
         for e in errors:
             self._log(f"  ! {e}")
 
+        if succeeded_ids and self.icon_check.isChecked():
+            self._make_folder_icons(self._last_pair_folders)
+
         self.apply_btn.setEnabled(True)
         self.apply_btn.setText("Apply")
-        op_word = "Moved" if move else "Copied"
+        op_word = past
 
         if errors:
             head = f"{op_word} {succeeded} pair(s) into:\n{out}\n\n{len(errors)} issue(s):\n"
@@ -2873,13 +3469,13 @@ class App(QtWidgets.QMainWindow):
         self.status_label.setText(f"{op_word} {succeeded} pair(s). {len(errors)} issue(s).")
         # Only trim the rows that actually moved — never re-scan (that would
         # rebuild the whole list and lose the user's other selections).
-        # Copied pairs stay in the list since their source files still exist.
-        if move and succeeded_ids:
+        # Copied/symlinked pairs stay in the list since their sources still exist.
+        if mode == "move" and succeeded_ids:
             self._remove_rows_by_ids(succeeded_ids)
 
     def _apply_single(self, row: dict):
-        """Apply (move/copy) the pair for a single row, using the global
-        Move-vs-Copy toggle. Behaves like _apply but on one row only."""
+        """Apply (move/copy/symlink) the pair for a single row, using the
+        global Operation selector. Behaves like _apply but on one row only."""
         if row["combo"].currentIndex() == 0:
             QtWidgets.QMessageBox.information(
                 self, "No video selected",
@@ -2907,8 +3503,9 @@ class App(QtWidgets.QMainWindow):
             )
             return
 
-        move = self.move_check.isChecked()
-        if move:
+        mode = self._op_mode()
+        _verb, ing, past = self._op_words(mode)
+        if mode == "move":
             ans = QtWidgets.QMessageBox.question(
                 self, "Confirm move",
                 f"Move this pair into:\n{out}\n\nThis removes it from the source folder.",
@@ -2928,17 +3525,19 @@ class App(QtWidgets.QMainWindow):
         apply_btn = row["apply_btn"]
         apply_btn.setEnabled(False)
         apply_btn.setText("Working…")
-        op_word_ing = "Moving" if move else "Copying"
-        self.status_label.setText(f"{op_word_ing} 1 pair…")
-        self._log(f"{op_word_ing} 1 pair → {out}")
+        self.status_label.setText(f"{ing} 1 pair…")
+        self._log(f"{ing} 1 pair → {out}")
         QtCore.QCoreApplication.processEvents()
 
-        succeeded_ids, errors = self._do_pair(out, move, selected)
+        succeeded_ids, errors = self._do_pair(out, mode, selected)
         succeeded = len(succeeded_ids)
-        op_word = "Moved" if move else "Copied"
+        op_word = past
         self._log(f"{op_word} {succeeded}/1 pair(s). {len(errors)} issue(s).")
         for e in errors:
             self._log(f"  ! {e}")
+
+        if succeeded_ids and self.icon_check.isChecked():
+            self._make_folder_icons(self._last_pair_folders)
 
         if errors:
             apply_btn.setEnabled(True)
@@ -2951,9 +3550,9 @@ class App(QtWidgets.QMainWindow):
 
         # Success. If we moved, the row's source files are gone, so drop
         # just this row (no re-scan — keeps every other row intact). If we
-        # copied, the source still exists, so keep the row and mark it done.
+        # copied/symlinked, the source still exists, so keep the row and mark done.
         self.status_label.setText(f"{op_word} 1 pair.")
-        if move and row["id"] in succeeded_ids:
+        if mode == "move" and row["id"] in succeeded_ids:
             self._remove_rows_by_ids({row["id"]})
             # `row` / `apply_btn` are now deleted — don't touch them again.
         else:
